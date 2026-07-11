@@ -10,21 +10,29 @@ import {
   type PublicTableState,
 } from "../protocol.js";
 
-/** Spin up a fully isolated server on an ephemeral port for one test. */
-async function makeServer(opts: RoomOptions): Promise<{ server: CreatedServer; port: number }> {
-  const server = createServer(opts);
+/** Spin up a fully isolated server (one seeded table) on an ephemeral port. */
+async function makeServer(
+  opts: RoomOptions,
+): Promise<{ server: CreatedServer; port: number; tableId: string }> {
+  const server = createServer({ roomDefaults: opts, seedTables: [{ name: "Test Table" }] });
   await new Promise<void>((r) => server.httpServer.listen(0, r));
   const port = (server.httpServer.address() as AddressInfo).port;
-  return { server, port };
+  const tableId = server.tables.list()[0]!.tableId;
+  return { server, port, tableId };
 }
 
 function connect(port: number): Socket {
   return ioClient(`http://localhost:${port}`, { transports: ["websocket"], forceNew: true });
 }
 
-function identify(sock: Socket, name: string, token?: string): Promise<IdentifyResult> {
+function identify(
+  sock: Socket,
+  name: string,
+  tableId: string,
+  token?: string,
+): Promise<IdentifyResult> {
   return new Promise((resolve, reject) => {
-    sock.emit(EVENTS.Identify, { name, sessionToken: token }, (res: IdentifyResult) =>
+    sock.emit(EVENTS.Identify, { name, tableId, sessionToken: token }, (res: IdentifyResult) =>
       res?.ok ? resolve(res) : reject(new Error("identify failed")),
     );
   });
@@ -57,15 +65,15 @@ function waitForState(
 
 describe("Phase 4 — turn timers", () => {
   it("auto-acts (folds facing a bet) when a player times out", async () => {
-    const { server, port } = await makeServer({
+    const { server, port, tableId } = await makeServer({
       turnTimeMs: 350,
       nextHandDelayMs: 60_000, // don't let a new hand start during the test
     });
     const a = connect(port);
     const b = connect(port);
     try {
-      await identify(a, "Alice");
-      await identify(b, "Bob");
+      await identify(a, "Alice", tableId);
+      await identify(b, "Bob", tableId);
       const dealt = waitForState(a, (s) => s.phase === "PREFLOP");
       await ack(a, EVENTS.Sit, { seatIndex: 0 });
       await ack(b, EVENTS.Sit, { seatIndex: 1 });
@@ -82,7 +90,7 @@ describe("Phase 4 — turn timers", () => {
     } finally {
       a.close();
       b.close();
-      server.room.dispose();
+      server.tables.disposeAll();
       await new Promise<void>((r) => server.io.close(() => r()));
     }
   });
@@ -90,12 +98,12 @@ describe("Phase 4 — turn timers", () => {
 
 describe("Phase 4 — reconnection grace", () => {
   it("holds the seat on disconnect and restores it on reconnect with the token", async () => {
-    const { server, port } = await makeServer({ turnTimeMs: 60_000, disconnectGraceMs: 60_000 });
+    const { server, port, tableId } = await makeServer({ turnTimeMs: 60_000, disconnectGraceMs: 60_000 });
     const a = connect(port);
     const b = connect(port);
     try {
-      const aRes = await identify(a, "Alice");
-      await identify(b, "Bob");
+      const aRes = await identify(a, "Alice", tableId);
+      await identify(b, "Bob", tableId);
       await ack(a, EVENTS.Sit, { seatIndex: 0 });
       await ack(b, EVENTS.Sit, { seatIndex: 1 });
 
@@ -109,7 +117,7 @@ describe("Phase 4 — reconnection grace", () => {
       const a2 = connect(port);
       try {
         const online = waitForState(b, (s) => s.seats[0]?.connected === true, 3000);
-        const back = await identify(a2, "Alice", aRes.sessionToken);
+        const back = await identify(a2, "Alice", tableId, aRes.sessionToken);
         expect(back.playerId).toBe(aRes.playerId);
         const onlineState = await online;
         expect(onlineState.seats[0]?.playerId).toBe(aRes.playerId);
@@ -118,13 +126,13 @@ describe("Phase 4 — reconnection grace", () => {
       }
     } finally {
       b.close();
-      server.room.dispose();
+      server.tables.disposeAll();
       await new Promise<void>((r) => server.io.close(() => r()));
     }
   });
 
   it("sits the player out once the grace period expires", async () => {
-    const { server, port } = await makeServer({
+    const { server, port, tableId } = await makeServer({
       turnTimeMs: 60_000,
       disconnectGraceMs: 300,
       nextHandDelayMs: 60_000,
@@ -132,8 +140,8 @@ describe("Phase 4 — reconnection grace", () => {
     const a = connect(port);
     const b = connect(port);
     try {
-      await identify(a, "Alice");
-      await identify(b, "Bob");
+      await identify(a, "Alice", tableId);
+      await identify(b, "Bob", tableId);
       await ack(a, EVENTS.Sit, { seatIndex: 0 });
       await ack(b, EVENTS.Sit, { seatIndex: 1 });
 
@@ -147,7 +155,7 @@ describe("Phase 4 — reconnection grace", () => {
       expect(out.seats[0]?.willSitOutNextHand).toBe(true);
     } finally {
       b.close();
-      server.room.dispose();
+      server.tables.disposeAll();
       await new Promise<void>((r) => server.io.close(() => r()));
     }
   });
@@ -155,12 +163,12 @@ describe("Phase 4 — reconnection grace", () => {
 
 describe("Phase 4 — chat", () => {
   it("broadcasts messages and serves history to new joiners", async () => {
-    const { server, port } = await makeServer({});
+    const { server, port, tableId } = await makeServer({});
     const a = connect(port);
     const b = connect(port);
     try {
-      await identify(a, "Alice");
-      await identify(b, "Bob");
+      await identify(a, "Alice", tableId);
+      await identify(b, "Bob", tableId);
 
       const gotByBob = new Promise<ChatMessage>((resolve) => {
         b.on(EVENTS.ChatMessage, (m: ChatMessage) => resolve(m));
@@ -176,7 +184,7 @@ describe("Phase 4 — chat", () => {
         const history = new Promise<ChatMessage[]>((resolve) => {
           c.on(EVENTS.ChatHistory, (h: ChatMessage[]) => resolve(h));
         });
-        await identify(c, "Carol");
+        await identify(c, "Carol", tableId);
         const h = await history;
         expect(h.some((m) => m.text === "hi there")).toBe(true);
       } finally {
@@ -185,7 +193,7 @@ describe("Phase 4 — chat", () => {
     } finally {
       a.close();
       b.close();
-      server.room.dispose();
+      server.tables.disposeAll();
       await new Promise<void>((r) => server.io.close(() => r()));
     }
   });

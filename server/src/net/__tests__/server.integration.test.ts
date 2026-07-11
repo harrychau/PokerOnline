@@ -6,15 +6,20 @@ import { EVENTS, type IdentifyResult, type PublicTableState } from "../protocol.
 
 let server: CreatedServer;
 let port: number;
+let tableId: string;
 
 beforeAll(async () => {
-  server = createServer({ tableId: "test", nextHandDelayMs: 150 });
+  server = createServer({
+    roomDefaults: { nextHandDelayMs: 150 },
+    seedTables: [{ name: "Test Table" }],
+  });
   await new Promise<void>((resolve) => server.httpServer.listen(0, resolve));
   port = (server.httpServer.address() as AddressInfo).port;
+  tableId = server.tables.list()[0]!.tableId;
 });
 
 afterAll(async () => {
-  server.room.dispose();
+  server.tables.disposeAll();
   await new Promise<void>((resolve) => server.io.close(() => resolve()));
 });
 
@@ -24,7 +29,7 @@ function connect(): Socket {
 
 function identify(sock: Socket, name: string): Promise<IdentifyResult> {
   return new Promise((resolve, reject) => {
-    sock.emit(EVENTS.Identify, { name }, (res: IdentifyResult) => {
+    sock.emit(EVENTS.Identify, { name, tableId }, (res: IdentifyResult) => {
       res?.ok ? resolve(res) : reject(new Error("identify failed"));
     });
   });

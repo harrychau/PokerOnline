@@ -16,32 +16,38 @@ import {
 const SERVER_URL =
   import.meta.env.VITE_SERVER_URL ??
   (import.meta.env.DEV ? "http://localhost:3001" : undefined);
-const TOKEN_KEY = "poker.sessionToken";
+// Session tokens are scoped per table — a token from one table is meaningless
+// (and rejected) at another, so each gets its own localStorage entry.
+const tokenKey = (tableId: string) => `poker.sessionToken.${tableId}`;
 
 export interface UseSocket {
   connected: boolean;
   state: PublicTableState | null;
   error: string | null;
   chat: ChatMessage[];
+  /** True once this table has been closed (by anyone); the UI should return to the lobby. */
+  closed: boolean;
   sit: (seatIndex: number, buyIn?: number) => void;
   leave: () => void;
   sitOut: (v: boolean) => void;
   act: (payload: ActionPayload) => void;
   sendChat: (text: string) => void;
+  closeTable: () => void;
 }
 
 /**
- * Owns the single Socket.IO connection. Identifies on connect (reusing a saved
- * session token so a page refresh reclaims the same seat), keeps the latest
- * server-pushed PublicTableState, and exposes intent submitters. All game logic
- * stays on the server — this hook only relays.
+ * Owns the single Socket.IO connection for one table. Identifies on connect
+ * (reusing a saved session token so a page refresh reclaims the same seat),
+ * keeps the latest server-pushed PublicTableState, and exposes intent
+ * submitters. All game logic stays on the server — this hook only relays.
  */
-export function useSocket(name: string): UseSocket {
+export function useSocket(name: string, tableId: string): UseSocket {
   const socketRef = useRef<Socket | null>(null);
   const [connected, setConnected] = useState(false);
   const [state, setState] = useState<PublicTableState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [chat, setChat] = useState<ChatMessage[]>([]);
+  const [closed, setClosed] = useState(false);
 
   useEffect(() => {
     const socket = io(SERVER_URL, { autoConnect: true });
@@ -49,12 +55,12 @@ export function useSocket(name: string): UseSocket {
 
     socket.on("connect", () => {
       setConnected(true);
-      const saved = localStorage.getItem(TOKEN_KEY) ?? undefined;
+      const saved = localStorage.getItem(tokenKey(tableId)) ?? undefined;
       socket.emit(
         EVENTS.Identify,
-        { name, sessionToken: saved },
-        (res: IdentifyResult) => {
-          if (res?.ok) localStorage.setItem(TOKEN_KEY, res.sessionToken);
+        { name, tableId, sessionToken: saved },
+        (res: IdentifyResult | { ok: false; error: string }) => {
+          if (res?.ok) localStorage.setItem(tokenKey(tableId), (res as IdentifyResult).sessionToken);
         },
       );
     });
@@ -71,13 +77,17 @@ export function useSocket(name: string): UseSocket {
     socket.on(EVENTS.ChatMessage, (m: ChatMessage) =>
       setChat((prev) => [...prev, m].slice(-100)),
     );
+    socket.on(EVENTS.TableClosed, () => {
+      localStorage.removeItem(tokenKey(tableId));
+      setClosed(true);
+    });
 
     return () => {
       socket.removeAllListeners();
       socket.close();
     };
-    // Reconnect only if the display name changes.
-  }, [name]);
+    // Reconnect if the display name or the table changes.
+  }, [name, tableId]);
 
   const emit = useCallback((event: string, payload: unknown) => {
     socketRef.current?.emit(event, payload, (ack: Ack) => {
@@ -102,6 +112,7 @@ export function useSocket(name: string): UseSocket {
     },
     [emit],
   );
+  const closeTable = useCallback(() => emit(EVENTS.CloseTable, {}), [emit]);
 
-  return { connected, state, error, chat, sit, leave, sitOut, act, sendChat };
+  return { connected, state, error, chat, closed, sit, leave, sitOut, act, sendChat, closeTable };
 }

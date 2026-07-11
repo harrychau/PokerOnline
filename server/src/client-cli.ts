@@ -15,7 +15,13 @@
 import readline from "node:readline";
 import { io as ioClient } from "socket.io-client";
 import { cardToString } from "./engine/cards.js";
-import { EVENTS, type IdentifyResult, type PublicTableState } from "./net/protocol.js";
+import {
+  EVENTS,
+  type CreateTableResult,
+  type IdentifyResult,
+  type ListTablesResult,
+  type PublicTableState,
+} from "./net/protocol.js";
 
 const args = process.argv.slice(2);
 const getArg = (flag: string, def: string): string => {
@@ -24,6 +30,9 @@ const getArg = (flag: string, def: string): string => {
 };
 const name = getArg("--name", `Player${Math.floor(Math.random() * 1000)}`);
 const url = getArg("--url", "http://localhost:3001");
+// Explicit --table joins a specific table id; otherwise join the first table
+// the lobby reports, or create one if none exist yet.
+const explicitTableId = args.includes("--table") ? getArg("--table", "") : null;
 
 // Let Socket.IO negotiate transport (polling → upgrade to websocket). This is
 // the most compatible default; forcing websocket-only can silently fail on some
@@ -38,11 +47,12 @@ const pending: string[] = [];
 
 console.log(`Connecting to ${url} ...`);
 
-socket.on("connect", () => {
-  socket.emit(EVENTS.Identify, { name }, (res: IdentifyResult) => {
+socket.on("connect", async () => {
+  const tableId = explicitTableId || (await resolveDefaultTableId());
+  socket.emit(EVENTS.Identify, { name, tableId }, (res: IdentifyResult) => {
     if (res?.ok) {
       myId = res.playerId;
-      console.log(`\nConnected as "${name}".`);
+      console.log(`\nConnected as "${name}" at table ${tableId}.`);
       console.log(`>>> To join the game, type:  sit 0   (then another player types  sit 1 )`);
       console.log(`    Full command list: help\n`);
       for (const line of pending.splice(0)) handleLine(line);
@@ -50,6 +60,22 @@ socket.on("connect", () => {
     }
   });
 });
+
+/** Join the first table the lobby reports, or create one if none exist. */
+function resolveDefaultTableId(): Promise<string> {
+  return new Promise((resolve) => {
+    socket.emit(EVENTS.ListTables, {}, (res: ListTablesResult) => {
+      const first = res?.ok ? res.tables[0] : undefined;
+      if (first) {
+        resolve(first.tableId);
+        return;
+      }
+      socket.emit(EVENTS.CreateTable, { name: "CLI Table" }, (created: CreateTableResult) => {
+        resolve(created.tableId);
+      });
+    });
+  });
+}
 
 // Surface connection problems instead of hanging silently.
 socket.on("connect_error", (err: Error) => {
@@ -77,7 +103,7 @@ function render(s: PublicTableState): void {
   const board = s.board.map(cardToString).join(" ") || "-";
   const lines: string[] = [];
   lines.push("");
-  lines.push(`========== Table "${s.tableId}"  hand #${s.handNumber} ==========`);
+  lines.push(`========== Table "${s.tableName}"  hand #${s.handNumber} ==========`);
   lines.push(`Phase: ${s.phase}   Board: ${board}   Pot: ${s.pot}`);
   for (let i = 0; i < s.config.maxSeats; i++) {
     const seat = s.seats[i];

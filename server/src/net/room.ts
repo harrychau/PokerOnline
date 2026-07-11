@@ -20,6 +20,7 @@ import {
   type IdentifyResult,
   type PublicTableState,
   type SitPayload,
+  type TableSummary,
 } from "./protocol.js";
 
 interface PlayerReg {
@@ -34,6 +35,8 @@ interface PlayerReg {
 
 export interface RoomOptions {
   tableId?: string;
+  /** Human-readable name shown in the lobby and table header. */
+  name?: string;
   config?: Partial<TableConfig>;
   /** Delay before auto-starting the next hand, ms. */
   nextHandDelayMs?: number;
@@ -45,6 +48,7 @@ export interface RoomOptions {
 
 export class Room {
   readonly tableId: string;
+  readonly name: string;
   readonly engine: GameEngine;
   private io: IOServer;
   private nextHandDelayMs: number;
@@ -70,6 +74,7 @@ export class Room {
   constructor(io: IOServer, opts: RoomOptions = {}) {
     this.io = io;
     this.tableId = opts.tableId ?? "main";
+    this.name = opts.name ?? "Table";
     this.engine = new GameEngine(opts.config ?? {});
     this.nextHandDelayMs = opts.nextHandDelayMs ?? 2500;
     this.turnTimeMs = opts.turnTimeMs ?? 20_000;
@@ -205,7 +210,8 @@ export class Room {
     };
     this.chatLog.push(msg);
     if (this.chatLog.length > 100) this.chatLog.shift();
-    this.io.emit(EVENTS.ChatMessage, msg);
+    // Scoped to this table's Socket.IO room only — other tables must not see it.
+    this.io.to(this.tableId).emit(EVENTS.ChatMessage, msg);
   }
 
   chatHistory(): ChatMessage[] {
@@ -296,9 +302,30 @@ export class Room {
     return ids;
   }
 
+  /** Lobby-level snapshot — enough to render a row in the "browse tables" list. */
+  summary(): TableSummary {
+    return {
+      tableId: this.tableId,
+      name: this.name,
+      playerCount: this.engine.state.seats.filter((p) => p !== null).length,
+      maxSeats: this.engine.state.config.maxSeats,
+      handNumber: this.engine.state.handNumber,
+      phase: this.engine.state.phase,
+    };
+  }
+
+  /** Whether any socket is currently attached to this table. */
+  hasConnections(): boolean {
+    for (const reg of this.playersById.values()) {
+      if (reg.socketId) return true;
+    }
+    return false;
+  }
+
   stateFor(viewerId: string | null): PublicTableState {
     return redactStateFor(this.engine, {
       tableId: this.tableId,
+      tableName: this.name,
       viewerId,
       connectedIds: this.connectedIds(),
       actingDeadline: this.turnDeadline,

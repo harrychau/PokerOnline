@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useSocket } from "./useSocket";
 import { Lobby } from "./components/Lobby";
 import { Table } from "./components/Table";
@@ -6,31 +6,60 @@ import { ActionBar } from "./components/ActionBar";
 import { Chat } from "./components/Chat";
 
 const NAME_KEY = "poker.name";
+const TABLE_KEY = "poker.tableId";
 
 export default function App() {
   const [name, setName] = useState<string | null>(() => localStorage.getItem(NAME_KEY));
+  const [tableId, setTableId] = useState<string | null>(() => localStorage.getItem(TABLE_KEY));
 
-  if (!name) {
+  const leaveTable = () => {
+    localStorage.removeItem(TABLE_KEY);
+    setTableId(null);
+  };
+
+  if (!name || !tableId) {
     return (
       <Lobby
-        onJoin={(n) => {
+        initialName={name ?? ""}
+        onJoin={(n, t) => {
           localStorage.setItem(NAME_KEY, n);
+          localStorage.setItem(TABLE_KEY, t);
           setName(n);
+          setTableId(t);
         }}
       />
     );
   }
-  return <Game name={name} onLeaveTable={() => setName(null)} />;
+  return <Game name={name} tableId={tableId} onLeaveTable={leaveTable} />;
 }
 
-function Game({ name, onLeaveTable }: { name: string; onLeaveTable: () => void }) {
-  const { connected, state, error, chat, sit, leave, sitOut, act, sendChat } = useSocket(name);
+function Game({
+  name,
+  tableId,
+  onLeaveTable,
+}: {
+  name: string;
+  tableId: string;
+  onLeaveTable: () => void;
+}) {
+  const { connected, state, error, chat, closed, sit, leave, sitOut, act, sendChat, closeTable } =
+    useSocket(name, tableId);
+
+  // The table was closed (by us or anyone else at it) — drop back to the lobby.
+  useEffect(() => {
+    if (closed) onLeaveTable();
+  }, [closed, onLeaveTable]);
 
   if (!connected || !state) {
     return (
       <div className="status-screen">
         <p>{error ? `⚠ ${error}` : "Connecting to the server…"}</p>
-        <p className="hint">Make sure the server is running: <code>npm run dev --workspace server</code></p>
+        <p className="hint">
+          Make sure the server is running: <code>npm run dev --workspace server</code>
+        </p>
+        <button className="btn btn-small" onClick={onLeaveTable}>
+          Back to lobby
+        </button>
       </div>
     );
   }
@@ -43,7 +72,7 @@ function Game({ name, onLeaveTable }: { name: string; onLeaveTable: () => void }
       <header className="topbar">
         <span className="brand">♠ Poker Online</span>
         <span className="table-meta">
-          Table "{state.tableId}" · Blinds {state.config.smallBlind}/{state.config.bigBlind}
+          Table "{state.tableName}" · Blinds {state.config.smallBlind}/{state.config.bigBlind}
         </span>
         <span className="conn">{connected ? "● online" : "○ offline"}</span>
       </header>
@@ -86,7 +115,15 @@ function Game({ name, onLeaveTable }: { name: string; onLeaveTable: () => void }
             </button>
           )}
           <button className="btn btn-small" onClick={onLeaveTable}>
-            Change name
+            Back to lobby
+          </button>
+          <button
+            className="btn btn-small btn-danger"
+            onClick={() => {
+              if (window.confirm(`Close "${state.tableName}" for everyone?`)) closeTable();
+            }}
+          >
+            Close table
           </button>
         </div>
       </footer>

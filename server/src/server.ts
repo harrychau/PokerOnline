@@ -1,5 +1,6 @@
 /**
- * Express + Socket.IO server hosting a single poker Room (Phase 2).
+ * Express + Socket.IO server hosting any number of poker Rooms (tables),
+ * managed by a TableManager.
  *
  * `createServer` is exported (rather than listening immediately) so tests can
  * spin the whole stack up on an ephemeral port. `index.ts` is the real entry
@@ -11,12 +12,14 @@ import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import express from "express";
 import { Server as IOServer } from "socket.io";
-import { Room, type RoomOptions } from "./net/room.js";
+import { TableManager, type TableManagerOptions } from "./net/tableManager.js";
+import type { Room, RoomOptions } from "./net/room.js";
 import {
   EVENTS,
   type Ack,
   type ActionPayload,
   type ChatPayload,
+  type CreateTablePayload,
   type IdentifyPayload,
   type SitOutPayload,
   type SitPayload,
@@ -25,10 +28,17 @@ import {
 export interface CreatedServer {
   httpServer: HttpServer;
   io: IOServer;
-  room: Room;
+  tables: TableManager;
 }
 
-export function createServer(roomOpts: RoomOptions = {}): CreatedServer {
+export interface ServerOptions {
+  /** Applied to every table (turn timing, grace period, next-hand delay). */
+  roomDefaults?: TableManagerOptions["defaults"];
+  /** Tables to auto-create at boot, e.g. a default "Main Table". */
+  seedTables?: Array<{ name: string; config?: RoomOptions["config"] }>;
+}
+
+export function createServer(opts: ServerOptions = {}): CreatedServer {
   const app = express();
   app.get("/health", (_req, res) => {
     res.json({ ok: true });
@@ -46,16 +56,36 @@ export function createServer(roomOpts: RoomOptions = {}): CreatedServer {
     cors: { origin: "*" },
   });
 
-  const room = new Room(io, roomOpts);
+  const tables = new TableManager(io, { defaults: opts.roomDefaults });
+  for (const seed of opts.seedTables ?? []) tables.create(seed);
+
+  // Which table each connected socket is currently identified to.
+  const socketTable = new Map<string, string>();
 
   io.on("connection", (socket) => {
-    // A connected-but-unidentified socket is already a spectator; it will
-    // receive redacted state once it identifies (or another event triggers a
-    // broadcast).
+    // A connected-but-unidentified socket can still browse/create tables; it
+    // only joins a Room's roster once it identifies.
+
+    socket.on(EVENTS.ListTables, (_payload: unknown, ack?: (r: unknown) => void) => {
+      ack?.({ ok: true, tables: tables.list() });
+    });
+
+    socket.on(EVENTS.CreateTable, (payload: CreateTablePayload, ack?: (r: unknown) => void) => {
+      try {
+        const room = tables.create(payload ?? {});
+        ack?.({ ok: true, tableId: room.tableId });
+      } catch (err) {
+        replyError(socket, ack, err);
+      }
+    });
 
     socket.on(EVENTS.Identify, (payload: IdentifyPayload, ack?: (r: unknown) => void) => {
       try {
+        const room = tables.get(payload?.tableId);
+        if (!room) throw new Error("That table no longer exists");
         const result = room.identify(socket.id, payload);
+        socket.join(room.tableId); // scopes chat + the table-closed notice
+        socketTable.set(socket.id, room.tableId);
         // Send recent chat history so a joiner/reconnecter sees the conversation.
         socket.emit(EVENTS.ChatHistory, room.chatHistory());
         ack?.(result);
@@ -65,47 +95,58 @@ export function createServer(roomOpts: RoomOptions = {}): CreatedServer {
     });
 
     socket.on(EVENTS.Sit, (payload: SitPayload, ack?: (r: Ack) => void) => {
-      guarded(socket, ack, (playerId) => room.sit(playerId, payload));
+      guarded(socket, ack, (room, playerId) => room.sit(playerId, payload));
     });
 
     socket.on(EVENTS.LeaveSeat, (_payload: unknown, ack?: (r: Ack) => void) => {
-      guarded(socket, ack, (playerId) => room.leaveSeat(playerId));
+      guarded(socket, ack, (room, playerId) => room.leaveSeat(playerId));
     });
 
     socket.on(EVENTS.SitOut, (payload: SitOutPayload, ack?: (r: Ack) => void) => {
-      guarded(socket, ack, (playerId) => room.setSitOut(playerId, !!payload?.sitOut));
+      guarded(socket, ack, (room, playerId) => room.setSitOut(playerId, !!payload?.sitOut));
     });
 
     socket.on(EVENTS.Action, (payload: ActionPayload, ack?: (r: Ack) => void) => {
-      guarded(socket, ack, (playerId) => room.action(playerId, payload));
+      guarded(socket, ack, (room, playerId) => room.action(playerId, payload));
     });
 
     socket.on(EVENTS.Chat, (payload: ChatPayload, ack?: (r: Ack) => void) => {
-      guarded(socket, ack, (playerId) => room.chat(playerId, payload?.text ?? ""));
+      guarded(socket, ack, (room, playerId) => room.chat(playerId, payload?.text ?? ""));
+    });
+
+    // Anyone at a table can close it — there are no accounts to gate this on.
+    socket.on(EVENTS.CloseTable, (_payload: unknown, ack?: (r: Ack) => void) => {
+      guarded(socket, ack, (room) => {
+        if (!tables.close(room.tableId)) throw new Error("Table already closed");
+      });
     });
 
     socket.on("disconnect", () => {
-      room.disconnect(socket.id);
+      const tableId = socketTable.get(socket.id);
+      socketTable.delete(socket.id);
+      if (tableId) tables.get(tableId)?.disconnect(socket.id);
     });
   });
 
-  return { httpServer, io, room };
+  return { httpServer, io, tables };
 
-  /** Run a room mutation on behalf of the socket's player, reporting errors. */
+  /** Run a mutation on the socket's current table on behalf of its player. */
   function guarded(
     socket: { id: string; emit: (ev: string, ...a: unknown[]) => void },
     ack: ((r: Ack) => void) | undefined,
-    fn: (playerId: string) => void,
+    fn: (room: Room, playerId: string) => void,
   ): void {
-    const playerId = room.playerIdForSocket(socket.id);
-    if (!playerId) {
+    const tableId = socketTable.get(socket.id);
+    const room = tableId ? tables.get(tableId) : undefined;
+    const playerId = room?.playerIdForSocket(socket.id);
+    if (!room || !playerId) {
       const error = "Identify before acting";
       ack?.({ ok: false, error });
       socket.emit(EVENTS.ErrorMsg, { message: error });
       return;
     }
     try {
-      fn(playerId);
+      fn(room, playerId);
       ack?.({ ok: true });
     } catch (err) {
       replyError(socket, ack, err);

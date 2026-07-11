@@ -81,8 +81,18 @@ export interface HandResult {
   shownHands: Record<string, HandRankLike>;
 }
 
+export interface TableSummary {
+  tableId: string;
+  name: string;
+  playerCount: number;
+  maxSeats: number;
+  handNumber: number;
+  phase: Phase;
+}
+
 export interface PublicTableState {
   tableId: string;
+  tableName: string;
   config: TableConfig;
   phase: Phase;
   board: Card[];
@@ -117,6 +127,16 @@ export interface IdentifyResult {
   sessionToken: string;
 }
 
+export interface CreateTableResult {
+  ok: true;
+  tableId: string;
+}
+
+export interface ListTablesResult {
+  ok: true;
+  tables: TableSummary[];
+}
+
 export type Ack = { ok: true } | { ok: false; error: string };
 
 export interface ActionPayload {
@@ -125,6 +145,9 @@ export interface ActionPayload {
 }
 
 export const EVENTS = {
+  ListTables: "listTables",
+  CreateTable: "createTable",
+  CloseTable: "closeTable",
   Identify: "identify",
   Sit: "sit",
   LeaveSeat: "leaveSeat",
@@ -135,6 +158,7 @@ export const EVENTS = {
   ErrorMsg: "errorMsg",
   ChatMessage: "chatMessage",
   ChatHistory: "chatHistory",
+  TableClosed: "tableClosed",
 } as const;
 
 export const HAND_CATEGORY_NAMES: Record<number, string> = {

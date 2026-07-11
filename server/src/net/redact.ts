@@ -13,6 +13,8 @@ import type { PublicSeat, PublicTableState } from "./protocol.js";
 
 export interface RedactOptions {
   tableId: string;
+  /** Human-readable table name; falls back to tableId if omitted. */
+  tableName?: string;
   /** The viewer's player id, or null for a pure spectator. */
   viewerId: string | null;
   /** Player ids whose sockets are currently connected. */
@@ -70,6 +72,7 @@ export function redactStateFor(engine: GameEngine, opts: RedactOptions): PublicT
 
   return {
     tableId,
+    tableName: opts.tableName ?? tableId,
     config: s.config,
     phase: s.phase,
     board: [...s.board],

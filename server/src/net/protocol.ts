@@ -44,6 +44,8 @@ export interface PublicSeat {
 /** The complete view of the table for one viewer. */
 export interface PublicTableState {
   tableId: string;
+  /** Human-readable table name, shown in the UI (distinct from the opaque id). */
+  tableName: string;
   config: TableConfig;
   phase: Phase;
   board: Card[];
@@ -84,10 +86,22 @@ export interface ChatMessage {
   ts: number;
 }
 
+/** A lobby-level summary of a table, for the "browse tables" screen. */
+export interface TableSummary {
+  tableId: string;
+  name: string;
+  playerCount: number;
+  maxSeats: number;
+  handNumber: number;
+  phase: Phase;
+}
+
 // --- Client → Server events -------------------------------------------------
 
 export interface IdentifyPayload {
   name: string;
+  /** Which table to join — required; use ListTables/CreateTable to pick one. */
+  tableId: string;
   /** Present when reconnecting to reclaim an existing identity/seat. */
   sessionToken?: string;
 }
@@ -95,6 +109,21 @@ export interface IdentifyResult {
   ok: true;
   playerId: string;
   sessionToken: string;
+}
+
+export interface CreateTablePayload {
+  /** Optional display name; the server assigns a default if omitted. */
+  name?: string;
+  config?: Partial<TableConfig>;
+}
+export interface CreateTableResult {
+  ok: true;
+  tableId: string;
+}
+
+export interface ListTablesResult {
+  ok: true;
+  tables: TableSummary[];
 }
 
 export interface SitPayload {
@@ -123,6 +152,9 @@ export type Ack = { ok: true } | { ok: false; error: string };
 
 export const EVENTS = {
   // client → server
+  ListTables: "listTables",
+  CreateTable: "createTable",
+  CloseTable: "closeTable",
   Identify: "identify",
   Sit: "sit",
   LeaveSeat: "leaveSeat",
@@ -134,4 +166,6 @@ export const EVENTS = {
   ErrorMsg: "errorMsg",
   ChatMessage: "chatMessage",
   ChatHistory: "chatHistory",
+  /** Pushed to everyone at a table when it is closed, so clients return to the lobby. */
+  TableClosed: "tableClosed",
 } as const;
