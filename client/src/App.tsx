@@ -44,6 +44,7 @@ function Game({
 }) {
   const { connected, state, error, chat, closed, sit, leave, sitOut, act, sendChat, closeTable } =
     useSocket(name, tableId);
+  const [chatOpen, setChatOpen] = useState(false);
 
   // The table was closed (by us or anyone else at it) — drop back to the lobby.
   useEffect(() => {
@@ -68,21 +69,36 @@ function Game({
   const yourTurn = state.legalActions !== null;
 
   return (
-    <div className="app">
+    <div className={`app ${chatOpen ? "app--chat-open" : ""}`}>
       <header className="topbar">
         <span className="brand">♠ Poker Online</span>
         <span className="table-meta">
-          Table "{state.tableName}" · Blinds {state.config.smallBlind}/{state.config.bigBlind}
+          {state.tableName} · Blinds {state.config.smallBlind}/{state.config.bigBlind}
         </span>
-        <span className="conn">{connected ? "● online" : "○ offline"}</span>
+        <div className="topbar-actions">
+          <button
+            className="icon-btn"
+            aria-label="Toggle chat"
+            onClick={() => setChatOpen((v) => !v)}
+          >
+            💬
+          </button>
+          <span className={`conn ${connected ? "" : "off"}`}>{connected ? "online" : "offline"}</span>
+        </div>
       </header>
 
       {error && <div className="error-banner">{error}</div>}
 
       <div className="main-area">
         <Table state={state} onSit={sit} />
-        <Chat messages={chat} youPlayerId={state.youPlayerId} onSend={sendChat} />
+        <Chat
+          messages={chat}
+          youPlayerId={state.youPlayerId}
+          onSend={sendChat}
+          onClose={() => setChatOpen(false)}
+        />
       </div>
+      <div className="chat-backdrop" onClick={() => setChatOpen(false)} />
 
       <footer className="controls">
         {yourTurn && state.legalActions ? (
@@ -100,25 +116,25 @@ function Game({
 
         <div className="controls-secondary">
           {you && !you.willSitOutNextHand && (
-            <button className="btn btn-small" onClick={() => sitOut(true)}>
+            <button className="btn btn-ghost" onClick={() => sitOut(true)}>
               Sit out
             </button>
           )}
           {you && you.willSitOutNextHand && (
-            <button className="btn btn-small" onClick={() => sitOut(false)}>
+            <button className="btn btn-ghost" onClick={() => sitOut(false)}>
               Sit back in
             </button>
           )}
           {you && (
-            <button className="btn btn-small" onClick={leave}>
+            <button className="btn btn-ghost" onClick={leave}>
               Leave seat
             </button>
           )}
-          <button className="btn btn-small" onClick={onLeaveTable}>
+          <button className="btn btn-ghost" onClick={onLeaveTable}>
             Back to lobby
           </button>
           <button
-            className="btn btn-small btn-danger"
+            className="btn btn-danger"
             onClick={() => {
               if (window.confirm(`Close "${state.tableName}" for everyone?`)) closeTable();
             }}
