@@ -1,0 +1,20 @@
+# Render Blueprint — one free Web Service that builds the client and serves it
+# alongside the Socket.IO game server on a single origin.
+#
+# Deploy: push this repo to GitHub, then in Render click
+#   New → Blueprint → pick the repo. Render reads this file and creates the service.
+# Or create a Web Service manually with the build/start commands below.
+services:
+  - type: web
+    name: poker-online
+    runtime: node
+    plan: free
+    # --include=dev: Render sets NODE_ENV=production, which makes `npm install`
+    # skip devDependencies — but Vite + TypeScript live there and are needed to
+    # build. This forces them to install for the build step.
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
