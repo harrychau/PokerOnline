@@ -189,3 +189,41 @@ acting player; disconnect holds the seat then restores it on token reconnect;
 grace expiry sits the player out; chat broadcasts + history on join. Also
 verified live in the browser (ring counts down, timeout advances the hand, chat
 posts). **65 server tests pass.**
+
+---
+
+## Deploy — one public URL anyone can play
+
+In production a **single Node service** builds and serves the React client
+*and* runs the Socket.IO server, so players open **one URL** and the socket
+connects same-origin (no CORS split). Locally nothing changes — the Vite dev
+server still serves the UI and the client falls back to `localhost:3001`.
+
+| Piece | What it does |
+|-------|--------------|
+| [`server.ts`](server/src/server.ts) `serveClient()` | Serves `client/dist` as static files + SPA fallback (no-op if the build is absent, e.g. in dev/tests) |
+| [`useSocket.ts`](client/src/useSocket.ts) | Connects same-origin in a production build; `localhost:3001` in dev; override with `VITE_SERVER_URL` |
+| root `build` / `start` scripts | `build` compiles client then server; `start` runs `node server/dist/index.js` |
+| [`render.yaml`](render.yaml) | Render Blueprint: free web service, build + start commands, `/health` check |
+
+**Build & run the production bundle locally:**
+
+```bash
+npm install
+npm run build          # → client/dist + server/dist
+npm start              # single server on http://localhost:3001 serving the UI
+```
+
+**Publish on Render (free, permanent URL):**
+
+1. Create an empty GitHub repo (no README), then push this repo to it.
+2. On [Render](https://render.com): **New → Blueprint**, pick the repo. It reads
+   `render.yaml` and creates the service (build `npm install --include=dev &&
+   npm run build`, start `npm start`).
+3. Open the assigned `https://<name>.onrender.com` URL — share it; anyone can sit
+   and play.
+
+> Notes: the free tier sleeps after ~15 min idle (first visitor waits ~30–60 s to
+> wake), and game state is **in-memory** — a restart/redeploy resets chips to the
+> starting stack. Both are fine for a play-money v1; swapping the in-memory store
+> for Redis/Postgres (Phase 5) is where persistence would live.
