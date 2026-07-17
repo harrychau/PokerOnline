@@ -21,6 +21,7 @@ import {
   type PublicTableState,
   type SitPayload,
   type TableSummary,
+  type UpdateSettingsPayload,
 } from "./protocol.js";
 
 interface PlayerReg {
@@ -44,7 +45,17 @@ export interface RoomOptions {
   turnTimeMs?: number;
   /** How long a disconnected player's seat is held before sit-out, ms. */
   disconnectGraceMs?: number;
+  /**
+   * Pause between streets once everyone is all-in, ms. The hand is already
+   * decided by then, so this is purely so the table gets to watch the board
+   * arrive instead of having the result land on them at once.
+   */
+  runoutRevealMs?: number;
 }
+
+/** Bounds for owner-set turn timers — long enough to think, short enough to play. */
+const MIN_TURN_TIME_MS = 5_000;
+const MAX_TURN_TIME_MS = 120_000;
 
 export class Room {
   readonly tableId: string;
@@ -54,12 +65,28 @@ export class Room {
   private nextHandDelayMs: number;
   private turnTimeMs: number;
   private graceMs: number;
+  private runoutRevealMs: number;
 
   private playersById = new Map<string, PlayerReg>();
   private tokenToId = new Map<string, string>();
   private socketToPlayer = new Map<string, string>();
 
+  /**
+   * Who may change this table's settings. The first player through the door owns
+   * it (they are, in practice, whoever just created it), and ownership moves on
+   * if they vanish — see `reassignOwner`.
+   */
+  private ownerPlayerId: string | null = null;
+
+  /**
+   * Owner changes waiting on the current hand to finish. Blinds, seat counts and
+   * stacks all feed a live hand's math, so they queue rather than apply mid-hand.
+   */
+  private pendingConfig: Partial<TableConfig> | null = null;
+  private pendingStacks = new Map<string, number>();
+
   private nextHandTimer: ReturnType<typeof setTimeout> | null = null;
+  private runoutTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Turn timer: which seat it's for, when it fires, and the handle.
   private turnTimer: ReturnType<typeof setTimeout> | null = null;
@@ -75,10 +102,13 @@ export class Room {
     this.io = io;
     this.tableId = opts.tableId ?? "main";
     this.name = opts.name ?? "Table";
-    this.engine = new GameEngine(opts.config ?? {});
+    // Stepped runout: the Room puts a real pause between streets, so the engine
+    // deals an all-in board one street per beat instead of in one go.
+    this.engine = new GameEngine(opts.config ?? {}, undefined, { steppedRunout: true });
     this.nextHandDelayMs = opts.nextHandDelayMs ?? 2500;
     this.turnTimeMs = opts.turnTimeMs ?? 20_000;
     this.graceMs = opts.disconnectGraceMs ?? 30_000;
+    this.runoutRevealMs = opts.runoutRevealMs ?? 1400;
   }
 
   // --- Identity / connection ------------------------------------------------
@@ -107,9 +137,34 @@ export class Room {
       this.tokenToId.set(sessionToken, playerId);
     }
 
+    // An unowned table is claimed by whoever turns up first — normally the
+    // player who just created it, since creating one drops you straight into it.
+    if (this.ownerPlayerId === null) this.ownerPlayerId = reg.playerId;
+
     this.socketToPlayer.set(socketId, reg.playerId);
     this.afterStateChange();
     return { ok: true, playerId: reg.playerId, sessionToken: reg.sessionToken };
+  }
+
+  /** True if this player currently controls the table's settings. */
+  isOwner(playerId: string): boolean {
+    return this.ownerPlayerId === playerId;
+  }
+
+  /**
+   * Hand the table to someone still here. Called once a departed owner's grace
+   * has run out — without it a table whose owner never comes back could never
+   * have its blinds touched again. Falls back to null so the next arrival claims
+   * it rather than leaving the table permanently unowned.
+   */
+  private reassignOwner(): void {
+    for (const reg of this.playersById.values()) {
+      if (reg.socketId) {
+        this.ownerPlayerId = reg.playerId;
+        return;
+      }
+    }
+    this.ownerPlayerId = null;
   }
 
   /**
@@ -126,7 +181,9 @@ export class Room {
     if (!reg || reg.socketId !== socketId) return;
 
     reg.socketId = null;
-    if (reg.seated) this.startGrace(playerId);
+    // An owner watching from the rail still needs a grace timer, so that
+    // ownership moves on if they never come back.
+    if (reg.seated || this.ownerPlayerId === playerId) this.startGrace(playerId);
     this.afterStateChange();
   }
 
@@ -136,8 +193,11 @@ export class Room {
       this.graceTimers.delete(playerId);
       const reg = this.playersById.get(playerId);
       if (!reg || reg.socketId) return; // reconnected in time
-      this.engine.forceFold(playerId);
-      this.engine.setSitOut(playerId, true);
+      if (reg.seated) {
+        this.engine.forceFold(playerId);
+        this.engine.setSitOut(playerId, true);
+      }
+      if (this.ownerPlayerId === playerId) this.reassignOwner();
       this.afterStateChange();
     }, this.graceMs);
     this.graceTimers.set(playerId, t);
@@ -189,6 +249,92 @@ export class Room {
     this.afterStateChange();
   }
 
+  /**
+   * Apply an owner's settings change. Blinds, seats and stacks are queued and
+   * land the moment the table is between hands — which, if no hand is running,
+   * is immediately (`afterStateChange` flushes them below). The turn timer needs
+   * no queue: it only sizes the *next* countdown.
+   *
+   * Everything is validated before anything is applied, so a single bad field
+   * rejects the whole change rather than half-applying it.
+   */
+  updateSettings(playerId: string, payload: UpdateSettingsPayload): void {
+    this.requireReg(playerId);
+    if (!this.isOwner(playerId)) throw new Error("Only the table owner can change settings");
+
+    const { config, stacks, turnTimeMs } = payload ?? {};
+
+    if (turnTimeMs !== undefined) {
+      if (
+        !Number.isFinite(turnTimeMs) ||
+        turnTimeMs < MIN_TURN_TIME_MS ||
+        turnTimeMs > MAX_TURN_TIME_MS
+      ) {
+        throw new Error(
+          `Turn time must be between ${MIN_TURN_TIME_MS / 1000} and ${MAX_TURN_TIME_MS / 1000} seconds`,
+        );
+      }
+    }
+    if (config) this.engine.nextConfig({ ...this.pendingConfig, ...config });
+    if (stacks) {
+      for (const [id, value] of Object.entries(stacks)) {
+        if (!Number.isInteger(value) || value < 0) {
+          throw new Error("A stack must be a whole number of chips, 0 or more");
+        }
+        if (!this.playersById.has(id)) throw new Error("Unknown player");
+      }
+    }
+
+    if (turnTimeMs !== undefined) this.turnTimeMs = Math.round(turnTimeMs);
+    if (config) this.pendingConfig = { ...this.pendingConfig, ...config };
+    if (stacks) for (const [id, v] of Object.entries(stacks)) this.pendingStacks.set(id, v);
+
+    this.afterStateChange();
+  }
+
+  /** Whether owner changes are still waiting on a hand to finish. */
+  private hasPendingSettings(): boolean {
+    return this.pendingConfig !== null || this.pendingStacks.size > 0;
+  }
+
+  /**
+   * Flush queued owner changes. Only ever called between hands. Re-validation can
+   * still fail here — a seat that was empty when the owner shrank the table may
+   * have filled since — so failures are reported to the owner rather than thrown
+   * into whatever unrelated event happened to trigger the flush.
+   */
+  private applyPendingSettings(): void {
+    const config = this.pendingConfig;
+    const stacks = [...this.pendingStacks];
+    this.pendingConfig = null;
+    this.pendingStacks.clear();
+
+    for (const [id, value] of stacks) {
+      // A player can leave between queueing and applying; their stack change
+      // simply has nowhere to land.
+      if (this.engine.state.seats.some((p) => p?.id === id)) {
+        this.tryOwnerChange(() => this.engine.setStack(id, value));
+      }
+    }
+    if (config) this.tryOwnerChange(() => this.engine.updateConfig(config));
+  }
+
+  private tryOwnerChange(fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const ownerSocket = this.ownerPlayerId
+        ? this.playersById.get(this.ownerPlayerId)?.socketId
+        : null;
+      if (ownerSocket) {
+        this.io.sockets.sockets
+          .get(ownerSocket)
+          ?.emit(EVENTS.ErrorMsg, { message: `Setting not applied: ${message}` });
+      }
+    }
+  }
+
   action(playerId: string, payload: ActionPayload): void {
     // The engine validates turn order and legality and throws on any violation.
     this.engine.applyAction(playerId, { type: payload.type, amount: payload.amount });
@@ -237,7 +383,14 @@ export class Room {
 
   /** Broadcast + keep timers in sync; queue the next hand if one just finished. */
   private afterStateChange(): void {
+    // The moment the table is between hands is the moment queued owner changes
+    // become safe to apply — do it before broadcasting so players see the new
+    // blinds and stacks in the same frame the hand ends.
+    if (!this.engine.isHandInProgress() && this.hasPendingSettings()) {
+      this.applyPendingSettings();
+    }
     this.syncTurnTimer();
+    this.syncRunout();
     this.broadcast();
     const phase = this.engine.state.phase;
     if (
@@ -246,6 +399,23 @@ export class Room {
     ) {
       this.scheduleNextHand();
     }
+  }
+
+  // --- All-in runout --------------------------------------------------------
+
+  /**
+   * Once everyone is all-in the hand is already decided, and the engine parks
+   * rather than dealing the rest of the board. Drip one street per beat so the
+   * table watches the cards arrive — the whole point of an all-in — instead of
+   * the board and the result landing together.
+   */
+  private syncRunout(): void {
+    if (this.runoutTimer || !this.engine.state.runoutPending) return;
+    this.runoutTimer = setTimeout(() => {
+      this.runoutTimer = null;
+      this.engine.stepRunout();
+      this.afterStateChange(); // re-arms until the runout reaches showdown
+    }, this.runoutRevealMs);
   }
 
   // --- Turn timer -----------------------------------------------------------
@@ -330,6 +500,8 @@ export class Room {
       connectedIds: this.connectedIds(),
       actingDeadline: this.turnDeadline,
       turnTimeMs: this.turnTimeMs,
+      ownerPlayerId: this.ownerPlayerId,
+      settingsPending: this.hasPendingSettings(),
     });
   }
 
@@ -351,9 +523,11 @@ export class Room {
   dispose(): void {
     if (this.nextHandTimer) clearTimeout(this.nextHandTimer);
     if (this.turnTimer) clearTimeout(this.turnTimer);
+    if (this.runoutTimer) clearTimeout(this.runoutTimer);
     for (const t of this.graceTimers.values()) clearTimeout(t);
     this.nextHandTimer = null;
     this.turnTimer = null;
+    this.runoutTimer = null;
     this.graceTimers.clear();
   }
 }

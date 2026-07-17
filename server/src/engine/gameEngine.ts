@@ -40,6 +40,22 @@ export interface TableState {
   handNumber: number;
   /** The result of the most recently completed hand, if any. */
   lastResult: HandResult | null;
+  /**
+   * True while the hand is an all-in runout waiting for the caller to deal the
+   * next street via `stepRunout()`. Only ever set when the engine was built with
+   * `steppedRunout`; otherwise a runout completes within the triggering call.
+   */
+  runoutPending: boolean;
+}
+
+export interface EngineOptions {
+  /**
+   * Deal an all-in runout one street per `stepRunout()` call instead of all at
+   * once. The engine still has no notion of time — this just hands the pacing to
+   * the caller (the Room, which puts a real delay between streets so the table
+   * can watch the board come out).
+   */
+  steppedRunout?: boolean;
 }
 
 /**
@@ -75,10 +91,12 @@ export class GameEngine {
   private handFlags: Map<string, { vpip: boolean; pfr: boolean }> = new Map();
   /** Players who asked to leave mid-hand; their seats clear once it settles. */
   private pendingRemoval: Set<string> = new Set();
+  private steppedRunout: boolean;
 
-  constructor(config: Partial<TableConfig> = {}, rng?: RNG) {
+  constructor(config: Partial<TableConfig> = {}, rng?: RNG, opts: EngineOptions = {}) {
     const merged = { ...DEFAULT_CONFIG, ...config };
     this.rng = rng ?? mulberry32(makeSecureSeed());
+    this.steppedRunout = opts.steppedRunout ?? false;
     this.state = {
       config: merged,
       seats: new Array(merged.maxSeats).fill(null),
@@ -90,6 +108,7 @@ export class GameEngine {
       actingIndex: null,
       handNumber: 0,
       lastResult: null,
+      runoutPending: false,
     };
   }
 
@@ -169,6 +188,95 @@ export class GameEngine {
     this.handFlags.delete(id);
     this.pendingRemoval.delete(id);
     // Stats deliberately survive: the same player may sit back down.
+  }
+
+  // ---------------------------------------------------------------------------
+  // Table settings
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Validate a config change against the current table and return the config it
+   * would produce. Throws (with a message meant for the player) if the result
+   * would be nonsense. Separated from `updateConfig` so a caller holding a
+   * change until the hand ends can still reject bad input immediately.
+   */
+  nextConfig(patch: Partial<TableConfig>): TableConfig {
+    const next: TableConfig = { ...this.state.config, ...patch };
+
+    const whole = (v: number, label: string) => {
+      if (!Number.isInteger(v) || v < 0) throw new Error(`${label} must be a whole number`);
+    };
+    whole(next.smallBlind, "Small blind");
+    whole(next.bigBlind, "Big blind");
+    whole(next.startingStack, "Starting stack");
+    whole(next.maxSeats, "Seat count");
+    whole(next.minPlayers, "Minimum players");
+
+    if (next.smallBlind < 1) throw new Error("Small blind must be at least 1");
+    if (next.bigBlind <= next.smallBlind) {
+      throw new Error("Big blind must be larger than the small blind");
+    }
+    if (next.startingStack < next.bigBlind) {
+      throw new Error("Starting stack must cover at least one big blind");
+    }
+    if (next.maxSeats < 2 || next.maxSeats > 10) throw new Error("Seats must be between 2 and 10");
+    if (next.minPlayers < 2) throw new Error("At least 2 players are needed to deal");
+    if (next.minPlayers > next.maxSeats) {
+      throw new Error("Minimum players cannot exceed the number of seats");
+    }
+
+    // Shrinking the table can't strand a seated player: their chips and their
+    // place in the betting order both hang off the seat index.
+    for (let i = next.maxSeats; i < this.state.seats.length; i++) {
+      if (this.state.seats[i]) {
+        throw new Error(`Seat ${i} must be empty before cutting the table to ${next.maxSeats} seats`);
+      }
+    }
+    return next;
+  }
+
+  /**
+   * Apply a config change. Only legal between hands — blinds and seat counts
+   * feed the betting math of a live hand, so changing them underneath one would
+   * corrupt it.
+   */
+  updateConfig(patch: Partial<TableConfig>): void {
+    if (this.isHandInProgress()) throw new Error("Cannot change table settings mid-hand");
+    const next = this.nextConfig(patch);
+
+    if (next.maxSeats !== this.state.seats.length) {
+      const seats: Array<Player | null> = new Array(next.maxSeats).fill(null);
+      for (let i = 0; i < Math.min(next.maxSeats, this.state.seats.length); i++) {
+        seats[i] = this.state.seats[i]!;
+      }
+      this.state.seats = seats;
+      // The button may have been sitting on a seat that no longer exists; -1
+      // simply makes the next hand start the rotation over.
+      if (this.state.buttonIndex >= next.maxSeats) this.state.buttonIndex = -1;
+    }
+
+    this.state.config = next;
+    this.state.minRaiseSize = next.bigBlind;
+  }
+
+  /**
+   * Set a seated player's stack outright (the owner topping someone up or
+   * knocking them down). Between hands only, for the same reason as config: a
+   * live hand's pots are computed from what players have already committed.
+   */
+  setStack(playerId: string, stack: number): void {
+    if (this.isHandInProgress()) throw new Error("Cannot adjust stacks mid-hand");
+    if (!Number.isInteger(stack) || stack < 0) {
+      throw new Error("A stack must be a whole number of chips, 0 or more");
+    }
+    const seat = this.findSeatByPlayerId(playerId);
+    if (seat === -1) throw new Error("That player is not seated at this table");
+    const p = this.state.seats[seat]!;
+    p.stack = stack;
+    // Keep the busted marker honest in both directions: chips make a player
+    // dealable again, and zeroing someone benches them.
+    if (stack === 0) p.status = PlayerStatus.Busted;
+    else if (p.status === PlayerStatus.Busted) p.status = PlayerStatus.SittingOut;
   }
 
   /** Mark a player to sit out (or come back) starting next hand. */
@@ -330,6 +438,7 @@ export class GameEngine {
     }
 
     this.state.phase = Phase.Preflop;
+    this.state.runoutPending = false;
     this.postBlinds(order);
 
     // Begin preflop betting, or — if everyone is already all-in from the blinds
@@ -337,7 +446,9 @@ export class GameEngine {
     if (this.hasPendingBetting()) {
       this.state.actingIndex = this.firstToActPreflop(order);
     } else {
-      this.dealRemainingAndShowdown();
+      this.returnUncalledBet();
+      this.resetStreetTrackers();
+      this.beginRunout();
     }
   }
 
@@ -563,12 +674,25 @@ export class GameEngine {
     this.returnUncalledBet();
     this.resetStreetTrackers();
 
+    // No betting decisions left (everyone is all-in) — the rest of the board is
+    // a formality, so hand it to the runout, which paces it out street by street
+    // rather than jumping straight to the result.
+    if (!this.hasPendingBetting()) {
+      this.beginRunout();
+      return;
+    }
+
     if (this.state.phase === Phase.River) {
       this.goToShowdown();
       return;
     }
 
-    // Deal the next street.
+    this.dealNextStreet();
+    this.state.actingIndex = this.firstToActPostflop();
+  }
+
+  /** Deal the community cards for the street after the current one. */
+  private dealNextStreet(): void {
     switch (this.state.phase) {
       case Phase.Preflop:
         this.dealBoard(3);
@@ -585,15 +709,6 @@ export class GameEngine {
       default:
         throw new Error(`Cannot advance street from phase ${this.state.phase}`);
     }
-
-    // If no meaningful betting remains (players are all-in), keep dealing.
-    if (!this.hasPendingBetting()) {
-      this.state.actingIndex = null;
-      this.advanceStreet();
-      return;
-    }
-
-    this.state.actingIndex = this.firstToActPostflop();
   }
 
   private resetStreetTrackers(): void {
@@ -608,25 +723,37 @@ export class GameEngine {
     for (const b of this.book.values()) b.lastActedSeq = -1;
   }
 
-  /** Deal any remaining community cards with no betting, then show down. */
-  private dealRemainingAndShowdown(): void {
-    // Reached straight from the blinds when everyone is already all-in, so this
-    // never passes through advanceStreet — refund here instead.
-    this.returnUncalledBet();
+  /**
+   * Enter the all-in runout: deal out whatever board remains and show down, with
+   * no betting in between. Under `steppedRunout` the engine stops here and waits
+   * for `stepRunout()` per street; otherwise it runs the whole thing now.
+   */
+  private beginRunout(): void {
     this.state.actingIndex = null;
-    if (this.state.phase === Phase.Preflop) {
-      this.dealBoard(3);
-      this.state.phase = Phase.Flop;
+    if (this.steppedRunout) {
+      this.state.runoutPending = true;
+      return;
     }
-    if (this.state.phase === Phase.Flop) {
-      this.dealBoard(1);
-      this.state.phase = Phase.Turn;
+    while (this.state.phase !== Phase.HandComplete) this.runoutStep();
+  }
+
+  /**
+   * Deal the next beat of an all-in runout — one street, or the showdown once
+   * the board is complete. No-op unless a runout is actually waiting, so the
+   * caller's timer can fire harmlessly late.
+   */
+  stepRunout(): void {
+    if (!this.state.runoutPending) return;
+    this.runoutStep();
+    if (this.state.phase === Phase.HandComplete) this.state.runoutPending = false;
+  }
+
+  private runoutStep(): void {
+    if (this.state.phase === Phase.River) {
+      this.goToShowdown();
+      return;
     }
-    if (this.state.phase === Phase.Turn) {
-      this.dealBoard(1);
-      this.state.phase = Phase.River;
-    }
-    this.goToShowdown();
+    this.dealNextStreet();
   }
 
   /**
@@ -743,6 +870,10 @@ export class GameEngine {
     this.state.phase = Phase.HandComplete;
     this.state.actingIndex = null;
     this.state.currentBet = 0;
+    // A hand can end before its runout does — the last player not yet all-in can
+    // leave the table, folding them out mid-board. Clear the flag here, the one
+    // place every ending passes through, so no pending step outlives the hand.
+    this.state.runoutPending = false;
 
     // One "won" per player per hand, however many pots they took.
     const winners = new Set<string>();

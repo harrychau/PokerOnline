@@ -23,6 +23,10 @@ export interface RedactOptions {
   actingDeadline?: number | null;
   /** Full turn time in ms (for the client countdown ring). */
   turnTimeMs?: number;
+  /** The table owner's player id, or null if the table has none. */
+  ownerPlayerId?: string | null;
+  /** Whether owner settings are queued behind the current hand. */
+  settingsPending?: boolean;
 }
 
 export function redactStateFor(engine: GameEngine, opts: RedactOptions): PublicTableState {
@@ -86,6 +90,9 @@ export function redactStateFor(engine: GameEngine, opts: RedactOptions): PublicT
     handNumber: s.handNumber,
     seats,
     youPlayerId: viewerId,
+    ownerPlayerId: opts.ownerPlayerId ?? null,
+    youAreOwner: viewerId !== null && viewerId === opts.ownerPlayerId,
+    settingsPending: opts.settingsPending ?? false,
     yourSeatIndex: yourSeatIndex === -1 ? null : yourSeatIndex,
     // Only attach legal actions when it is genuinely this viewer's turn.
     legalActions:

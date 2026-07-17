@@ -7,6 +7,7 @@ import {
   type ChatMessage,
   type IdentifyResult,
   type PublicTableState,
+  type UpdateSettingsPayload,
 } from "./protocol";
 
 // In a production build the client is served by the same Node process as the
@@ -33,6 +34,8 @@ export interface UseSocket {
   act: (payload: ActionPayload) => void;
   sendChat: (text: string) => void;
   closeTable: () => void;
+  /** Owner-only: change blinds, stacks, and other table settings. */
+  updateSettings: (payload: UpdateSettingsPayload) => void;
 }
 
 /**
@@ -55,6 +58,11 @@ export function useSocket(name: string, tableId: string): UseSocket {
 
     socket.on("connect", () => {
       setConnected(true);
+      // Being connected is proof that whatever we last complained about is over.
+      // Connection failures have no natural expiry the way a rejected action
+      // does, so without this the "connection failed" notice would outlive the
+      // reconnect and sit on screen over a perfectly working table.
+      setError(null);
       const saved = localStorage.getItem(tokenKey(tableId)) ?? undefined;
       socket.emit(
         EVENTS.Identify,
@@ -113,6 +121,23 @@ export function useSocket(name: string, tableId: string): UseSocket {
     [emit],
   );
   const closeTable = useCallback(() => emit(EVENTS.CloseTable, {}), [emit]);
+  const updateSettings = useCallback(
+    (payload: UpdateSettingsPayload) => emit(EVENTS.UpdateSettings, payload),
+    [emit],
+  );
 
-  return { connected, state, error, chat, closed, sit, leave, sitOut, act, sendChat, closeTable };
+  return {
+    connected,
+    state,
+    error,
+    chat,
+    closed,
+    sit,
+    leave,
+    sitOut,
+    act,
+    sendChat,
+    closeTable,
+    updateSettings,
+  };
 }

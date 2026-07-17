@@ -76,6 +76,16 @@ export interface PublicTableState {
 
   /** The viewer's own player id, or null if they are a pure spectator. */
   youPlayerId: string | null;
+  /** Player id of the table's owner, or null while the table has none. */
+  ownerPlayerId: string | null;
+  /** True when the viewer owns this table and may change its settings. */
+  youAreOwner: boolean;
+  /**
+   * True when the owner has changed settings that a live hand is holding up.
+   * They land as soon as the hand finishes; the UI says so rather than letting
+   * the owner think their change was dropped.
+   */
+  settingsPending: boolean;
   /** The viewer's seat index, or null if unseated. */
   yourSeatIndex: number | null;
   /** Legal actions for the viewer — present only when it is their turn. */
@@ -161,6 +171,19 @@ export interface ChatPayload {
   text: string;
 }
 
+/**
+ * An owner-only change to how the table runs. Every field is optional so the
+ * client can send just what the owner touched. Anything that a live hand depends
+ * on is queued and applied the moment that hand settles.
+ */
+export interface UpdateSettingsPayload {
+  config?: Partial<TableConfig>;
+  /** New stacks, by player id — the owner topping players up or down. */
+  stacks?: Record<string, number>;
+  /** How long each player gets to act, in ms. Takes effect from the next turn. */
+  turnTimeMs?: number;
+}
+
 /** Generic acknowledgement returned via Socket.IO callbacks. */
 export type Ack = { ok: true } | { ok: false; error: string };
 
@@ -177,6 +200,7 @@ export const EVENTS = {
   SitOut: "sitOut",
   Action: "action",
   Chat: "chat",
+  UpdateSettings: "updateSettings",
   // server → client
   State: "state",
   ErrorMsg: "errorMsg",

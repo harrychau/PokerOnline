@@ -23,6 +23,7 @@ import {
   type IdentifyPayload,
   type SitOutPayload,
   type SitPayload,
+  type UpdateSettingsPayload,
 } from "./net/protocol.js";
 
 export interface CreatedServer {
@@ -112,6 +113,10 @@ export function createServer(opts: ServerOptions = {}): CreatedServer {
 
     socket.on(EVENTS.Chat, (payload: ChatPayload, ack?: (r: Ack) => void) => {
       guarded(socket, ack, (room, playerId) => room.chat(playerId, payload?.text ?? ""));
+    });
+
+    socket.on(EVENTS.UpdateSettings, (payload: UpdateSettingsPayload, ack?: (r: Ack) => void) => {
+      guarded(socket, ack, (room, playerId) => room.updateSettings(playerId, payload ?? {}));
     });
 
     // Anyone at a table can close it — there are no accounts to gate this on.

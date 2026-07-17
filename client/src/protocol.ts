@@ -119,6 +119,12 @@ export interface PublicTableState {
   handNumber: number;
   seats: Array<PublicSeat | null>;
   youPlayerId: string | null;
+  /** Player id of the table's owner, or null while the table has none. */
+  ownerPlayerId: string | null;
+  /** True when the viewer owns this table and may change its settings. */
+  youAreOwner: boolean;
+  /** True when owner changes are queued behind the hand in progress. */
+  settingsPending: boolean;
   yourSeatIndex: number | null;
   legalActions: LegalActions | null;
   lastResult: HandResult | null;
@@ -159,6 +165,15 @@ export interface ActionPayload {
   amount?: number;
 }
 
+/** An owner-only change to how the table runs; every field is optional. */
+export interface UpdateSettingsPayload {
+  config?: Partial<TableConfig>;
+  /** New stacks, by player id. */
+  stacks?: Record<string, number>;
+  /** How long each player gets to act, in ms. */
+  turnTimeMs?: number;
+}
+
 export const EVENTS = {
   ListTables: "listTables",
   CreateTable: "createTable",
@@ -169,6 +184,7 @@ export const EVENTS = {
   SitOut: "sitOut",
   Action: "action",
   Chat: "chat",
+  UpdateSettings: "updateSettings",
   State: "state",
   ErrorMsg: "errorMsg",
   ChatMessage: "chatMessage",
