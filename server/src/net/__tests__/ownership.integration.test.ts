@@ -1,81 +1,82 @@
 import { describe, it, expect } from "vitest";
-import type { AddressInfo } from "node:net";
-import { io as ioClient, type Socket } from "socket.io-client";
-import { createServer, type CreatedServer } from "../../server.js";
-import type { RoomOptions } from "../room.js";
-import { EVENTS, type Ack, type IdentifyResult, type PublicTableState } from "../protocol.js";
-
-async function makeServer(
-  opts: RoomOptions = {},
-): Promise<{ server: CreatedServer; port: number; tableId: string }> {
-  const server = createServer({ roomDefaults: opts, seedTables: [{ name: "Test Table" }] });
-  await new Promise<void>((r) => server.httpServer.listen(0, r));
-  const port = (server.httpServer.address() as AddressInfo).port;
-  const tableId = server.tables.list()[0]!.tableId;
-  return { server, port, tableId };
-}
-
-function shutdown(server: CreatedServer, ...socks: Socket[]): void {
-  for (const s of socks) s.close();
-  server.tables.disposeAll();
-  server.io.close();
-  server.httpServer.close();
-}
-
-/**
- * A socket plus a running log of every state it was pushed. The log matters:
- * identify broadcasts immediately, so a listener attached afterwards misses the
- * table's opening state and waits forever for a change that already happened.
- */
-function watch(port: number) {
-  const sock = ioClient(`http://localhost:${port}`, { transports: ["websocket"], forceNew: true });
-  const seen: PublicTableState[] = [];
-  const waiters: Array<{
-    pred: (s: PublicTableState) => boolean;
-    resolve: (s: PublicTableState) => void;
-  }> = [];
-
-  sock.on(EVENTS.State, (s: PublicTableState) => {
-    seen.push(s);
-    for (let i = waiters.length - 1; i >= 0; i--) {
-      if (waiters[i]!.pred(s)) {
-        waiters[i]!.resolve(s);
-        waiters.splice(i, 1);
-      }
+import { EVENTS } from "../protocol.js";
+import { createTable, makeEmptyServer, makeServer, shutdown, watch } from "./helpers.js";
+describe("table ownership — one owner per table", () => {
+  it("boots with no tables at all, so no table exists that nobody created", async () => {
+    const { server } = await makeEmptyServer();
+    try {
+      expect(server.tables.list()).toEqual([]);
+    } finally {
+      shutdown(server);
     }
   });
 
-  return {
-    sock,
-    /** Board sizes across every state pushed, in order, deduped. */
-    boardSteps: () => [...new Set(seen.map((s) => s.board.length))],
-    identify(name: string, tableId: string): Promise<IdentifyResult> {
-      return new Promise((resolve, reject) => {
-        sock.emit(EVENTS.Identify, { name, tableId }, (res: IdentifyResult) =>
-          res?.ok ? resolve(res) : reject(new Error("identify failed")),
-        );
-      });
-    },
-    send(event: string, payload: unknown): Promise<Ack> {
-      return new Promise((resolve) => sock.emit(event, payload, (a: Ack) => resolve(a)));
-    },
-    /** Resolve with the first state — already seen or yet to arrive — matching. */
-    until(pred: (s: PublicTableState) => boolean, timeoutMs = 4000): Promise<PublicTableState> {
-      const already = seen.find(pred);
-      if (already) return Promise.resolve(already);
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("timed out waiting for state")), timeoutMs);
-        waiters.push({
-          pred,
-          resolve: (s) => {
-            clearTimeout(timer);
-            resolve(s);
-          },
-        });
-      });
-    },
-  };
-}
+  it("makes the player who created a table its owner", async () => {
+    const { server, port } = await makeEmptyServer();
+    // The lobby creates from a socket that never identifies, then the game
+    // connects on a fresh one — mirroring how the real client does it.
+    const lobby = watch(port);
+    const creator = watch(port);
+    const other = watch(port);
+    try {
+      const tableId = await createTable(lobby.sock, "Harry's table");
+      const c = await creator.identify("Creator", tableId);
+      const o = await other.identify("Other", tableId);
+
+      expect((await creator.until((s) => s.youPlayerId === c.playerId)).youAreOwner).toBe(true);
+      const asOther = await other.until((s) => s.youPlayerId === o.playerId);
+      expect(asOther.youAreOwner).toBe(false);
+      expect(asOther.ownerPlayerId).toBe(c.playerId);
+    } finally {
+      shutdown(server, lobby.sock, creator.sock, other.sock);
+    }
+  }, 15_000);
+
+  it("names exactly one owner however many players are at the table", async () => {
+    const { server, port } = await makeEmptyServer();
+    const lobby = watch(port);
+    const players = [watch(port), watch(port), watch(port), watch(port)];
+    try {
+      const tableId = await createTable(lobby.sock, "Six max");
+      const ids: string[] = [];
+      for (const p of players) ids.push((await p.identify("P", tableId)).playerId);
+
+      // Every player's own view, and every view's idea of who the owner is.
+      const views = await Promise.all(
+        players.map((p, i) => p.until((s) => s.youPlayerId === ids[i])),
+      );
+      expect(views.filter((v) => v.youAreOwner)).toHaveLength(1);
+      expect(new Set(views.map((v) => v.ownerPlayerId)).size).toBe(1);
+      expect(views[0]!.ownerPlayerId).toBe(ids[0]); // the creator
+    } finally {
+      shutdown(server, lobby.sock, ...players.map((p) => p.sock));
+    }
+  }, 15_000);
+
+  it("keeps owners separate across two tables", async () => {
+    const { server, port } = await makeEmptyServer();
+    const lobby = watch(port);
+    const a = watch(port);
+    const b = watch(port);
+    try {
+      const tableA = await createTable(lobby.sock, "A");
+      const tableB = await createTable(lobby.sock, "B");
+      const ida = await a.identify("A", tableA);
+      const idb = await b.identify("B", tableB);
+
+      const viewA = await a.until((s) => s.tableId === tableA);
+      const viewB = await b.until((s) => s.tableId === tableB);
+      expect(viewA.youAreOwner).toBe(true);
+      expect(viewB.youAreOwner).toBe(true);
+      // Each owns their own table only — not one owner across the server.
+      expect(viewA.ownerPlayerId).toBe(ida.playerId);
+      expect(viewB.ownerPlayerId).toBe(idb.playerId);
+      expect(ida.playerId).not.toBe(idb.playerId);
+    } finally {
+      shutdown(server, lobby.sock, a.sock, b.sock);
+    }
+  }, 15_000);
+});
 
 describe("table ownership", () => {
   it("gives the table to the first arrival and lets only them change settings", async () => {
@@ -228,7 +229,7 @@ describe("all-in runout pacing", () => {
       expect(done.board).toHaveLength(5);
 
       // Every street got its own broadcast: an unpaced runout would jump 0 → 5.
-      expect(a.boardSteps()).toEqual([0, 3, 4, 5]);
+      expect([...new Set(a.states().map((s) => s.board.length))]).toEqual([0, 3, 4, 5]);
     } finally {
       shutdown(server, a.sock, b.sock);
     }

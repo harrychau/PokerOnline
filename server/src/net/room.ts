@@ -88,9 +88,9 @@ export class Room {
   private nextHandTimer: ReturnType<typeof setTimeout> | null = null;
   private runoutTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Turn timer: which seat it's for, when it fires, and the handle.
+  // Turn timer: which turn it's for, when it fires, and the handle.
   private turnTimer: ReturnType<typeof setTimeout> | null = null;
-  private turnSeat: number | null = null;
+  private turnId: number | null = null;
   private turnDeadline: number | null = null;
 
   // Per-player reconnect grace timers.
@@ -422,30 +422,41 @@ export class Room {
 
   /**
    * Arm (or leave running) the timer for the player currently to act. Called
-   * after every state change. If the acting seat is unchanged, the existing
-   * timer keeps running — so an unrelated event (a sit, a chat) can't reset an
+   * after every state change. While the same turn is still live the existing
+   * timer keeps running, so an unrelated event (a sit, a chat) can't reset an
    * opponent's clock.
+   *
+   * A turn is identified by the engine's turn counter, NOT by the acting seat.
+   * The same seat can be handed two turns in a row — heads-up, the big blind's
+   * preflop option is followed by their first move on the flop — and keying off
+   * the seat made that look like one continuous turn, so the second turn
+   * silently inherited whatever was left of the first one's clock.
    */
   private syncTurnTimer(): void {
     const seat = this.engine.state.actingIndex;
-    if (seat === this.turnSeat && this.turnTimer) return;
+    const turn = seat === null ? null : this.engine.state.actingTurn;
+    if (turn !== null && turn === this.turnId && this.turnTimer) return;
 
     if (this.turnTimer) {
       clearTimeout(this.turnTimer);
       this.turnTimer = null;
     }
-    this.turnSeat = seat;
+    this.turnId = turn;
     if (seat === null) {
       this.turnDeadline = null;
       return;
     }
     this.turnDeadline = Date.now() + this.turnTimeMs;
-    this.turnTimer = setTimeout(() => this.onTurnTimeout(seat), this.turnTimeMs);
+    this.turnTimer = setTimeout(() => this.onTurnTimeout(turn!), this.turnTimeMs);
   }
 
-  private onTurnTimeout(seat: number): void {
-    // Ignore if the situation moved on before the timer fired.
-    if (this.engine.state.actingIndex !== seat) return;
+  private onTurnTimeout(turn: number): void {
+    // Ignore if the situation moved on before the timer fired. Comparing the
+    // turn rather than the seat also covers the case where the same player has
+    // since been handed a fresh turn: that turn gets its own full clock.
+    if (this.engine.state.actingTurn !== turn) return;
+    const seat = this.engine.state.actingIndex;
+    if (seat === null) return;
     const p = this.engine.state.seats[seat];
     if (!p) return;
 

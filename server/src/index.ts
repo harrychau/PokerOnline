@@ -12,9 +12,10 @@ const tableConfig = { maxSeats: 6, smallBlind: 1, bigBlind: 2, startingStack: 20
 
 const { httpServer } = createServer({
   roomDefaults: { config: tableConfig },
-  // One table exists at boot so players have somewhere to sit immediately;
-  // anyone can create more or close this one from the lobby.
-  seedTables: [{ name: "Main Table", config: tableConfig }],
+  // No table exists at boot, deliberately. A seeded table has no creator, so
+  // ownership of it would fall to whoever happened to connect first — arbitrary,
+  // and the one table on the server nobody chose to make. With none, every table
+  // is created by a player, and that player owns it.
 });
 
 httpServer.listen(PORT, () => {

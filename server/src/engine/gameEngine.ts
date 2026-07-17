@@ -37,6 +37,14 @@ export interface TableState {
   minRaiseSize: number;
   /** Seat index of the player to act, or null when no one is to act. */
   actingIndex: number | null;
+  /**
+   * Bumped every time the engine hands the action to a player, and never reset.
+   * A seat index alone cannot tell one turn from the next, because the same seat
+   * can be handed two turns in a row — heads-up, the big blind's preflop option
+   * is followed by their first move on the flop. Anything putting a clock on a
+   * turn must key off this, or the second turn inherits the first one's clock.
+   */
+  actingTurn: number;
   handNumber: number;
   /** The result of the most recently completed hand, if any. */
   lastResult: HandResult | null;
@@ -106,10 +114,21 @@ export class GameEngine {
       currentBet: 0,
       minRaiseSize: merged.bigBlind,
       actingIndex: null,
+      actingTurn: 0,
       handNumber: 0,
       lastResult: null,
       runoutPending: false,
     };
+  }
+
+  /**
+   * The single place the action changes hands. Routing every assignment through
+   * here is what keeps `actingTurn` honest — a turn handed to the same seat
+   * twice running still counts as two turns.
+   */
+  private setActing(seat: number | null): void {
+    this.state.actingIndex = seat;
+    if (seat !== null) this.state.actingTurn += 1;
   }
 
   // ---------------------------------------------------------------------------
@@ -444,7 +463,7 @@ export class GameEngine {
     // Begin preflop betting, or — if everyone is already all-in from the blinds
     // — run the board out and go straight to showdown.
     if (this.hasPendingBetting()) {
-      this.state.actingIndex = this.firstToActPreflop(order);
+      this.setActing(this.firstToActPreflop(order));
     } else {
       this.returnUncalledBet();
       this.resetStreetTrackers();
@@ -593,7 +612,7 @@ export class GameEngine {
   private advanceAfterAction(fromSeat: number): void {
     const next = this.findNextActor(fromSeat);
     if (next !== null) {
-      this.state.actingIndex = next;
+      this.setActing(next);
       return;
     }
     // Betting round complete for this street.
@@ -688,7 +707,7 @@ export class GameEngine {
     }
 
     this.dealNextStreet();
-    this.state.actingIndex = this.firstToActPostflop();
+    this.setActing(this.firstToActPostflop());
   }
 
   /** Deal the community cards for the street after the current one. */
@@ -729,7 +748,7 @@ export class GameEngine {
    * for `stepRunout()` per street; otherwise it runs the whole thing now.
    */
   private beginRunout(): void {
-    this.state.actingIndex = null;
+    this.setActing(null);
     if (this.steppedRunout) {
       this.state.runoutPending = true;
       return;
@@ -772,7 +791,7 @@ export class GameEngine {
 
   private goToShowdown(): void {
     this.state.phase = Phase.Showdown;
-    this.state.actingIndex = null;
+    this.setActing(null);
     this.settleShowdown();
     this.state.phase = Phase.HandComplete;
   }
@@ -868,7 +887,7 @@ export class GameEngine {
   private finishHand(result: HandResult): void {
     this.state.lastResult = result;
     this.state.phase = Phase.HandComplete;
-    this.state.actingIndex = null;
+    this.setActing(null);
     this.state.currentBet = 0;
     // A hand can end before its runout does — the last player not yet all-in can
     // leave the table, folding them out mid-board. Clear the flag here, the one

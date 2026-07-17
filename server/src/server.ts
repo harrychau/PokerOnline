@@ -35,7 +35,11 @@ export interface CreatedServer {
 export interface ServerOptions {
   /** Applied to every table (turn timing, grace period, next-hand delay). */
   roomDefaults?: TableManagerOptions["defaults"];
-  /** Tables to auto-create at boot, e.g. a default "Main Table". */
+  /**
+   * Tables to auto-create at boot. Production seeds none — a table nobody
+   * created has no natural owner — so this is really for tests that want a
+   * table to exist without going through the lobby.
+   */
   seedTables?: Array<{ name: string; config?: RoomOptions["config"] }>;
 }
 
