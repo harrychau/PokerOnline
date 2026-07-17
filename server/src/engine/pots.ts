@@ -11,6 +11,8 @@ export interface Contribution {
   playerId: string;
   contributed: number;
   folded: boolean;
+  /** Fold order within the hand (0 = folded first), or null if still in. */
+  foldOrder?: number | null;
 }
 
 /**
@@ -38,10 +40,12 @@ export function buildPots(contributions: Contribution[]): Pot[] {
   for (const level of levels) {
     let amount = 0;
     const eligible: string[] = [];
+    const contributors: string[] = [];
     for (const c of withChips) {
       if (c.contributed > prevLevel) {
         // This player participates in this layer for the capped amount.
         amount += Math.min(c.contributed, level) - prevLevel;
+        contributors.push(c.playerId);
       }
       // Eligible if they reached this level and did not fold.
       if (!c.folded && c.contributed >= level) {
@@ -54,13 +58,35 @@ export function buildPots(contributions: Contribution[]): Pot[] {
     const prev = pots[pots.length - 1];
     if (prev && sameSet(prev.eligiblePlayerIds, eligible)) {
       prev.amount += amount;
+      for (const id of contributors) {
+        if (!prev.contributorIds.includes(id)) prev.contributorIds.push(id);
+      }
     } else if (amount > 0) {
-      pots.push({ amount, eligiblePlayerIds: eligible });
+      pots.push({ amount, eligiblePlayerIds: eligible, contributorIds: contributors });
     }
     prevLevel = level;
   }
 
   return pots;
+}
+
+/**
+ * Of `ids`, the one that folded latest. Players with no recorded fold order are
+ * ignored — a caller only reaches this for a layer where everyone folded, so an
+ * unrecorded id means missing data rather than a live player.
+ */
+function lastToFold(ids: string[], foldOrderById: Record<string, number>): string | null {
+  let best: string | null = null;
+  let bestOrder = -1;
+  for (const id of ids) {
+    const order = foldOrderById[id];
+    if (order === undefined) continue;
+    if (order > bestOrder) {
+      bestOrder = order;
+      best = id;
+    }
+  }
+  return best;
 }
 
 function sameSet(a: string[], b: string[]): boolean {
@@ -80,12 +106,16 @@ function sameSet(a: string[], b: string[]): boolean {
  *                        split leaves an indivisible remainder, the odd chip(s)
  *                        go to the earliest eligible player in this order
  *                        (standard "odd chip to first seat left of the button").
+ * @param foldOrderById   Fold order per player (0 = folded first). Needed only
+ *                        to resolve a pot layer every eligible player folded out
+ *                        of; see the `contenders.length === 0` branch below.
  */
 export function distributePots(
   pots: Pot[],
   holeCardsById: Record<string, [Card, Card]>,
   board: Card[],
   orderFromButton: string[],
+  foldOrderById: Record<string, number> = {},
 ): { results: PotResult[]; payouts: Record<string, number> } {
   const payouts: Record<string, number> = {};
   const results: PotResult[] = [];
@@ -104,7 +134,29 @@ export function distributePots(
 
   for (const pot of pots) {
     const contenders = pot.eligiblePlayerIds.filter((id) => holeCardsById[id]);
-    if (contenders.length === 0) continue;
+
+    if (contenders.length === 0) {
+      // Every player who put chips into this layer folded. This happens when
+      // two players build a side pot over the top of a short all-in and then
+      // both give up on it — the short stack can never win these chips, so the
+      // layer reaches showdown with nobody eligible.
+      //
+      // At a real table this pot would already have been pushed: the moment the
+      // second-to-last contributor folded, the one still standing was its only
+      // eligible player and it was theirs outright. Folding afterwards forfeits
+      // the pots that are still contested, not one already won. So the layer
+      // goes to whoever folded last. Dropping it instead would delete the chips
+      // from the game.
+      const claimant = lastToFold(pot.contributorIds, foldOrderById);
+      if (claimant === null) continue;
+      payouts[claimant] = (payouts[claimant] ?? 0) + pot.amount;
+      results.push({
+        amount: pot.amount,
+        uncontested: true,
+        winners: [{ playerId: claimant, amountWon: pot.amount, hand: null }],
+      });
+      continue;
+    }
 
     // Find the best hand among contenders.
     let best: HandRank | null = null;

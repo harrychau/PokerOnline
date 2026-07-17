@@ -63,6 +63,39 @@ export interface Player {
   hasActedThisStreet: boolean;
   /** True if the player wants to be dealt out of the next hand. */
   sitOutNextHand: boolean;
+  /**
+   * The order in which this player folded within the current hand (0 = first to
+   * fold), or null if they are still in. This decides who takes a side pot whose
+   * every eligible player ended up folding: the last of them to fold had already
+   * won it outright at the moment the others gave up.
+   */
+  foldOrder: number | null;
+}
+
+/**
+ * Lifetime counters behind the stats shown above each seat. Stored as raw
+ * numerators/denominators rather than percentages so the UI can format them and
+ * so they stay exact as they accumulate.
+ */
+export interface PlayerStats {
+  /** Hands dealt into (the denominator for VPIP and PFR). */
+  hands: number;
+  /** Hands where the player voluntarily put chips in preflop — blinds excluded. */
+  vpip: number;
+  /** Hands where the player raised preflop. */
+  pfr: number;
+  /** Bets + raises across all streets (aggression factor numerator). */
+  aggressive: number;
+  /** Calls across all streets (aggression factor denominator). */
+  calls: number;
+  /** Hands that reached showdown. */
+  showdowns: number;
+  /** Hands where the player won at least one pot. */
+  won: number;
+}
+
+export function emptyStats(): PlayerStats {
+  return { hands: 0, vpip: 0, pfr: 0, aggressive: 0, calls: 0, showdowns: 0, won: 0 };
 }
 
 export interface TableConfig {
@@ -88,6 +121,12 @@ export interface Pot {
   amount: number;
   /** Player ids eligible to win this pot (never includes folded players). */
   eligiblePlayerIds: string[];
+  /**
+   * Every player who put chips into this layer, folded or not. Only used to
+   * resolve a layer whose eligible set is empty because all of its contributors
+   * folded — without this the chips would have no owner.
+   */
+  contributorIds: string[];
 }
 
 /** How a single pot was awarded, for hand history / UI. */

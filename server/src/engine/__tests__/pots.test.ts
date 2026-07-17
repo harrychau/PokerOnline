@@ -178,3 +178,48 @@ describe("distributePots — awarding chips", () => {
     expect(totalPaid).toBe(totalContributed);
   });
 });
+
+describe("pot layers nobody is eligible for", () => {
+  // Two players build a side pot over the top of a short all-in and then both
+  // fold it away. The layer reaches showdown with an empty eligible set; the
+  // chips still have to go somewhere.
+  const contribs: Contribution[] = [
+    { playerId: "short", contributed: 29, folded: false, foldOrder: null },
+    { playerId: "first", contributed: 106, folded: true, foldOrder: 0 },
+    { playerId: "last", contributed: 106, folded: true, foldOrder: 1 },
+  ];
+
+  it("records the contributors of a layer, not just who can win it", () => {
+    const pots = buildPots(contribs);
+    const orphan = pots.find((p) => p.eligiblePlayerIds.length === 0)!;
+    expect(orphan).toBeDefined();
+    expect(orphan.amount).toBe(154); // (106 - 29) * 2
+    expect(new Set(orphan.contributorIds)).toEqual(new Set(["first", "last"]));
+  });
+
+  it("awards it to the last of them to fold rather than dropping the chips", () => {
+    const pots = buildPots(contribs);
+    const board = cardsFromString("2c 7d 9h Jd Ks");
+    const { results, payouts } = distributePots(
+      pots,
+      { short: cardsFromString("As Ad") as [never, never] },
+      board,
+      ["short"],
+      { first: 0, last: 1 },
+    );
+
+    // Every chip contributed is still accounted for.
+    const paid = Object.values(payouts).reduce((a, b) => a + b, 0);
+    expect(paid).toBe(29 * 3 + 77 * 2);
+
+    // "last" folded after "first", so the side pot was already theirs.
+    expect(payouts["last"]).toBe(154);
+    expect(payouts["first"]).toBeUndefined();
+    expect(payouts["short"]).toBe(87); // main pot, 29 from each of the three
+
+    // A pot won because everyone else folded is not a showdown win.
+    const orphanResult = results.find((r) => r.amount === 154)!;
+    expect(orphanResult.uncontested).toBe(true);
+    expect(orphanResult.winners[0]!.hand).toBeNull();
+  });
+});

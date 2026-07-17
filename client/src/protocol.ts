@@ -48,6 +48,17 @@ export interface LegalActions {
   maxBetTo: number;
 }
 
+/** Raw lifetime counters behind the stats shown above each seat. */
+export interface PlayerStats {
+  hands: number;
+  vpip: number;
+  pfr: number;
+  aggressive: number;
+  calls: number;
+  showdowns: number;
+  won: number;
+}
+
 export interface PublicSeat {
   seatIndex: number;
   playerId: string;
@@ -61,6 +72,7 @@ export interface PublicSeat {
   isActing: boolean;
   connected: boolean;
   willSitOutNextHand: boolean;
+  stats: PlayerStats | null;
 }
 
 export interface HandRankLike {
@@ -96,7 +108,10 @@ export interface PublicTableState {
   config: TableConfig;
   phase: Phase;
   board: Card[];
+  /** Chips in the middle, excluding bets still in front of players this street. */
   pot: number;
+  /** Everything committed this hand, including this street's bets. Sizes raises. */
+  potTotal: number;
   currentBet: number;
   minRaiseSize: number;
   buttonIndex: number;

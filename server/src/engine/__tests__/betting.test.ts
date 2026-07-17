@@ -14,6 +14,7 @@ function makePlayer(overrides: Partial<Player> = {}): Player {
     handCommitted: 0,
     hasActedThisStreet: false,
     sitOutNextHand: false,
+    foldOrder: null,
     ...overrides,
   };
 }

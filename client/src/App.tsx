@@ -105,7 +105,7 @@ function Game({
           <ActionBar
             legal={state.legalActions}
             currentBet={state.currentBet}
-            pot={state.pot}
+            pot={state.potTotal}
             onAct={act}
           />
         ) : (

@@ -222,3 +222,171 @@ describe("seating and busting", () => {
     expect(e.state.buttonIndex).not.toBe(firstButton);
   });
 });
+
+describe("uncalled bets are returned", () => {
+  it("hands back a shove nobody could cover instead of routing it via a side pot", () => {
+    const e = new GameEngine({ ...CONFIG, maxSeats: 3 }, mulberry32(4));
+    e.seatPlayer({ id: "deep", name: "Deep", seatIndex: 0, buyIn: 200 });
+    e.seatPlayer({ id: "short", name: "Short", seatIndex: 1, buyIn: 50 });
+    e.startHand();
+
+    // Heads-up: the button (seat 0) is the SB and acts first.
+    e.applyAction("deep", { type: "raise", amount: 200 }); // shove
+    e.applyAction("short", { type: "call" }); // can only cover 50
+
+    // 150 of the shove was never called, so it goes straight back rather than
+    // into a pot only "deep" could win.
+    expect(e.state.phase).toBe(Phase.HandComplete);
+    const potTotal = e.state.lastResult!.potResults.reduce((a, p) => a + p.amount, 0);
+    expect(potTotal).toBe(100); // 50 each — the honest, contested amount
+    expect(e.state.lastResult!.potResults).toHaveLength(1);
+    expect(totalChips(e)).toBe(250);
+  });
+
+  it("returns the uncalled part of a raise that took the pot", () => {
+    const e = new GameEngine({ ...CONFIG, maxSeats: 3 }, mulberry32(5));
+    e.seatPlayer({ id: "a", name: "A", seatIndex: 0, buyIn: 200 });
+    e.seatPlayer({ id: "b", name: "B", seatIndex: 1, buyIn: 200 });
+    e.startHand();
+
+    e.applyAction("a", { type: "raise", amount: 100 });
+    e.applyAction("b", { type: "fold" });
+
+    // B put in the big blind (2) and gave up. A collects that, not 100.
+    const result = e.state.lastResult!;
+    expect(result.potResults[0]!.amount).toBe(4); // A's matched 2 + B's 2
+    expect(result.potResults[0]!.winners[0]!.amountWon).toBe(4);
+    expect(e.state.seats[0]!.stack).toBe(202); // A: +2, not +100
+    expect(totalChips(e)).toBe(400);
+  });
+
+  it("leaves a matched all-in alone", () => {
+    const e = new GameEngine({ ...CONFIG, maxSeats: 3 }, mulberry32(6));
+    e.seatPlayer({ id: "a", name: "A", seatIndex: 0, buyIn: 100 });
+    e.seatPlayer({ id: "b", name: "B", seatIndex: 1, buyIn: 100 });
+    e.startHand();
+
+    e.applyAction("a", { type: "raise", amount: 100 });
+    e.applyAction("b", { type: "call" });
+
+    // Fully covered: nothing to give back, one pot of everything.
+    const potTotal = e.state.lastResult!.potResults.reduce((a, p) => a + p.amount, 0);
+    expect(potTotal).toBe(200);
+    expect(totalChips(e)).toBe(200);
+  });
+});
+
+describe("chips are conserved", () => {
+  it("survives thousands of randomly-played hands without creating or losing a chip", () => {
+    for (let seed = 0; seed < 400; seed++) {
+      const r = mulberry32(seed);
+      const rng = () => r.next();
+      const e = new GameEngine({ ...CONFIG, maxSeats: 6 }, mulberry32(seed + 7));
+      const nPlayers = 2 + Math.floor(rng() * 4);
+      let total = 0;
+      for (let i = 0; i < nPlayers; i++) {
+        // Small stacks relative to the blinds keep all-ins frequent.
+        const buyIn = 1 + Math.floor(rng() * 40);
+        total += buyIn;
+        e.seatPlayer({ id: `p${i}`, name: `P${i}`, seatIndex: i, buyIn });
+      }
+
+      for (let hand = 0; hand < 8 && e.canStartHand(); hand++) {
+        e.startHand();
+        let guard = 0;
+        while (e.isHandInProgress() && guard++ < 400) {
+          const cur = e.legalActionsForCurrent();
+          if (!cur) break;
+          const legal = e.legalActionsFor(e.state.actingIndex!);
+          const roll = rng();
+          if (roll < 0.15) e.applyAction(cur.playerId, { type: "fold" });
+          else if (roll < 0.45 && legal.canCheck) e.applyAction(cur.playerId, { type: "check" });
+          else if (roll < 0.7 && legal.canCall) e.applyAction(cur.playerId, { type: "call" });
+          else if (legal.canBet || legal.canRaise) {
+            const span = legal.maxBetTo - legal.minBetTo;
+            const to = legal.minBetTo + Math.floor(rng() * (span + 1));
+            e.applyAction(cur.playerId, { type: legal.canBet ? "bet" : "raise", amount: to });
+          } else if (legal.canCheck) e.applyAction(cur.playerId, { type: "check" });
+          else if (legal.canCall) e.applyAction(cur.playerId, { type: "call" });
+          else e.applyAction(cur.playerId, { type: "fold" });
+        }
+        expect(totalChips(e), `seed ${seed}, hand ${hand}`).toBe(total);
+      }
+    }
+  });
+});
+
+describe("leaving mid-hand", () => {
+  it("lets a player leave cleanly once the hand has settled", () => {
+    const e = new GameEngine({ ...CONFIG, maxSeats: 3 }, mulberry32(11));
+    e.seatPlayer({ id: "a", name: "A", seatIndex: 0, buyIn: 100 });
+    e.seatPlayer({ id: "b", name: "B", seatIndex: 1, buyIn: 100 });
+    e.startHand();
+
+    e.applyAction("a", { type: "raise", amount: 100 });
+    e.applyAction("b", { type: "call" });
+    expect(e.state.phase).toBe(Phase.HandComplete);
+
+    // The pot is already settled, so the seat can go immediately and A takes
+    // whatever they ended the hand with.
+    const aStack = e.state.seats[0]!.stack;
+    e.removePlayer("a");
+    expect(e.state.seats[0]).toBeNull();
+    expect(totalChips(e)).toBe(200 - aStack);
+  });
+
+  it("holds the seat until the hand settles rather than deleting committed chips", () => {
+    const e = new GameEngine({ ...CONFIG, maxSeats: 3 }, mulberry32(12));
+    e.seatPlayer({ id: "a", name: "A", seatIndex: 0, buyIn: 100 });
+    e.seatPlayer({ id: "b", name: "B", seatIndex: 1, buyIn: 100 });
+    e.seatPlayer({ id: "c", name: "C", seatIndex: 2, buyIn: 100 });
+    e.startHand();
+
+    e.applyAction("a", { type: "raise", amount: 20 });
+    e.applyAction("b", { type: "call" });
+    e.applyAction("c", { type: "call" });
+
+    // B walks away with 20 already in the pot, mid-hand.
+    e.removePlayer("b");
+    expect(e.state.seats[1]).not.toBeNull(); // seat held, chips still in the pot
+    expect(totalChips(e)).toBe(300);
+
+    // Play the hand out; B's seat clears once it settles.
+    let guard = 0;
+    while (e.isHandInProgress() && guard++ < 100) {
+      const cur = e.legalActionsForCurrent();
+      if (!cur) break;
+      const legal = e.legalActionsFor(e.state.actingIndex!);
+      e.applyAction(cur.playerId, legal.canCheck ? { type: "check" } : { type: "fold" });
+    }
+    expect(e.state.phase).toBe(Phase.HandComplete);
+    expect(e.state.seats[1]).toBeNull();
+  });
+});
+
+describe("folding forfeits chips already bet", () => {
+  it("does not refund the biggest bettor of the street once they have folded", () => {
+    const e = new GameEngine({ ...CONFIG, maxSeats: 3 }, mulberry32(3));
+    e.seatPlayer({ id: "a", name: "A", seatIndex: 0, buyIn: 200 });
+    e.seatPlayer({ id: "b", name: "B", seatIndex: 1, buyIn: 200 });
+    e.seatPlayer({ id: "c", name: "C", seatIndex: 2, buyIn: 200 });
+    e.startHand();
+
+    // A opens for 100 and then drops off the table. Room folds a disconnected
+    // player when their grace expires, which lands out of turn and leaves the
+    // street's biggest bettor folded.
+    e.applyAction("a", { type: "raise", amount: 100 });
+    e.forceFold("a");
+    expect(e.state.seats[0]!.status).toBe(PlayerStatus.Folded);
+
+    // B gives up as well, so C takes the pot unchallenged.
+    e.applyAction("b", { type: "fold" });
+
+    // A's 100 is forfeit and belongs to C. Handing back the uncalled 98 would
+    // both rob C and make "bet big, then pull the plug" a way to keep chips.
+    expect(e.state.seats[0]!.stack).toBe(100);
+    expect(e.state.seats[2]!.stack).toBe(301); // 200 - 2 + (100 + 1 + 2)
+    expect(e.state.lastResult!.potResults[0]!.amount).toBe(103);
+    expect(totalChips(e)).toBe(600);
+  });
+});

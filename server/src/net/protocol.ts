@@ -10,7 +10,7 @@
  */
 import type { Card } from "../engine/cards.js";
 import type { LegalActions } from "../engine/betting.js";
-import type { HandResult, Phase, PlayerStatus, TableConfig } from "../engine/types.js";
+import type { HandResult, Phase, PlayerStats, PlayerStatus, TableConfig } from "../engine/types.js";
 
 /** One seat as seen by a particular viewer. */
 export interface PublicSeat {
@@ -39,6 +39,13 @@ export interface PublicSeat {
    * into a hand yet (both otherwise report status SITTING_OUT between hands).
    */
   willSitOutNextHand: boolean;
+  /**
+   * Public playing stats for this player at this table. Raw counters, not
+   * percentages — the client formats them. Safe to broadcast: these describe
+   * betting patterns everyone at the table watched happen, and reveal nothing
+   * about cards that are still face-down.
+   */
+  stats: PlayerStats | null;
 }
 
 /** The complete view of the table for one viewer. */
@@ -49,8 +56,17 @@ export interface PublicTableState {
   config: TableConfig;
   phase: Phase;
   board: Card[];
-  /** Total chips in the pot(s) this hand. */
+  /**
+   * Chips gathered into the middle. Excludes bets still in front of players on
+   * the current street — those are each seat's `streetCommitted`, and the UI
+   * draws them there. Adding the two together gives `potTotal`.
+   */
   pot: number;
+  /**
+   * Everything committed this hand, including the current street's bets. This is
+   * what pot-relative bet sizing ("½ pot", "pot") should be computed against.
+   */
+  potTotal: number;
   currentBet: number;
   minRaiseSize: number;
   buttonIndex: number;

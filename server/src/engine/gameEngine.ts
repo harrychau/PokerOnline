@@ -12,11 +12,13 @@ import {
   type HandResult,
   type Player,
   type PlayerAction,
+  type PlayerStats,
   type PotResult,
   type TableConfig,
   DEFAULT_CONFIG,
   Phase,
   PlayerStatus,
+  emptyStats,
 } from "./types.js";
 
 /**
@@ -62,6 +64,17 @@ export class GameEngine {
   /** Increments on every full (betting-reopening) bet or raise this street. */
   private fullRaiseSeq = 0;
   private book: Map<string, ActingBook> = new Map();
+  /** Next fold order number to hand out this hand. */
+  private foldSeq = 0;
+  /**
+   * Lifetime stats per player id. Keyed by id rather than seat so they survive
+   * a disconnect, a seat change, or standing up and sitting back down.
+   */
+  private stats: Map<string, PlayerStats> = new Map();
+  /** Per-hand "already counted" flags so VPIP/PFR count hands, not actions. */
+  private handFlags: Map<string, { vpip: boolean; pfr: boolean }> = new Map();
+  /** Players who asked to leave mid-hand; their seats clear once it settles. */
+  private pendingRemoval: Set<string> = new Set();
 
   constructor(config: Partial<TableConfig> = {}, rng?: RNG) {
     const merged = { ...DEFAULT_CONFIG, ...config };
@@ -109,10 +122,17 @@ export class GameEngine {
       handCommitted: 0,
       hasActedThisStreet: false,
       sitOutNextHand: false,
+      foldOrder: null,
     };
     this.state.seats[seatIndex] = player;
     this.book.set(id, { lastActedSeq: -1 });
+    if (!this.stats.has(id)) this.stats.set(id, emptyStats());
     return player;
+  }
+
+  /** Lifetime stats for a player id, or null if we've never seen them. */
+  statsFor(id: string): PlayerStats | null {
+    return this.stats.get(id) ?? null;
   }
 
   /** Remove a player from their seat entirely (leave table / cash out). */
@@ -120,17 +140,35 @@ export class GameEngine {
     const seat = this.findSeatByPlayerId(id);
     if (seat === -1) return;
     const player = this.state.seats[seat]!;
+
     // If they are in a live hand, fold them first so pots stay consistent.
     if (this.isHandInProgress() && player.status === PlayerStatus.Active) {
       if (this.state.actingIndex === seat) {
         this.applyAction(id, { type: "fold" });
       } else {
-        player.status = PlayerStatus.Folded;
+        this.markFolded(player);
         this.checkFoldOut();
       }
     }
+
+    // Chips already committed this hand belong to the pot, and the seat is what
+    // ties them to it. Emptying the seat now would delete them from the game (a
+    // player can also leave while all-in, which folding above does not cover),
+    // so hold the seat until the hand settles and clear it in finishHand.
+    if (this.isHandInProgress() && player.handCommitted > 0) {
+      this.pendingRemoval.add(id);
+      return;
+    }
+
+    this.clearSeat(seat, id);
+  }
+
+  private clearSeat(seat: number, id: string): void {
     this.state.seats[seat] = null;
     this.book.delete(id);
+    this.handFlags.delete(id);
+    this.pendingRemoval.delete(id);
+    // Stats deliberately survive: the same player may sit back down.
   }
 
   /** Mark a player to sit out (or come back) starting next hand. */
@@ -178,8 +216,55 @@ export class GameEngine {
       this.applyAction(playerId, { type: "fold" });
       return;
     }
-    p.status = PlayerStatus.Folded;
+    this.markFolded(p);
     this.checkFoldOut();
+  }
+
+  /**
+   * Fold a player, stamping the order they folded in. Every path that folds
+   * someone goes through here so no fold is ever left unstamped — the fold order
+   * decides who takes a side pot all of whose eligible players folded.
+   */
+  private markFolded(p: Player): void {
+    if (p.status === PlayerStatus.Folded) return;
+    p.status = PlayerStatus.Folded;
+    p.foldOrder = this.foldSeq++;
+  }
+
+  private statsOf(id: string): PlayerStats {
+    let s = this.stats.get(id);
+    if (!s) {
+      s = emptyStats();
+      this.stats.set(id, s);
+    }
+    return s;
+  }
+
+  /**
+   * Fold the player's action into their lifetime stats.
+   *
+   * VPIP and PFR count HANDS, not actions, so a player who calls and later
+   * re-raises the same hand adds one to each — hence the per-hand flags. Blinds
+   * never count: they are forced, and a big blind checking their option has not
+   * chosen to play. The aggression factor counts every street.
+   */
+  private recordActionStats(p: Player, type: PlayerAction["type"]): void {
+    const s = this.statsOf(p.id);
+    const flags = this.handFlags.get(p.id);
+    const preflop = this.state.phase === Phase.Preflop;
+    const voluntary = type === "call" || type === "bet" || type === "raise";
+    const aggressive = type === "bet" || type === "raise";
+
+    if (preflop && voluntary && flags && !flags.vpip) {
+      flags.vpip = true;
+      s.vpip += 1;
+    }
+    if (preflop && aggressive && flags && !flags.pfr) {
+      flags.pfr = true;
+      s.pfr += 1;
+    }
+    if (aggressive) s.aggressive += 1;
+    else if (type === "call") s.calls += 1;
   }
 
   /** Seats eligible to be dealt into a new hand. */
@@ -212,11 +297,15 @@ export class GameEngine {
       p.streetCommitted = 0;
       p.handCommitted = 0;
       p.hasActedThisStreet = false;
+      p.foldOrder = null;
       // Eligible players become Active; others sit out this hand.
       const isEligible = eligible.includes(p.seatIndex);
       p.status = isEligible ? PlayerStatus.Active : PlayerStatus.SittingOut;
       this.book.set(p.id, { lastActedSeq: -1 });
+      this.handFlags.set(p.id, { vpip: false, pfr: false });
+      if (isEligible) this.statsOf(p.id).hands += 1;
     }
+    this.foldSeq = 0;
 
     // Rotate the button to the next eligible seat clockwise.
     this.state.buttonIndex = this.nextEligibleSeatFrom(this.state.buttonIndex, eligible);
@@ -345,10 +434,12 @@ export class GameEngine {
     }
 
     if (n.type === "fold") {
-      p.status = PlayerStatus.Folded;
+      this.markFolded(p);
     } else if (n.allIn || p.stack === 0) {
       p.status = PlayerStatus.AllIn;
     }
+
+    this.recordActionStats(p, n.type);
 
     // Update the betting line for bets/raises.
     if (n.betTo > this.state.currentBet) {
@@ -418,7 +509,58 @@ export class GameEngine {
   // Street / phase transitions
   // ---------------------------------------------------------------------------
 
+  /**
+   * Give back the part of a bet that nobody matched.
+   *
+   * If exactly one player has out-committed everyone else on this street, the
+   * excess was never contested and is returned to their stack instead of going
+   * into the pot. This is the standard "uncalled bet is returned" rule.
+   *
+   * It matters most on all-ins. Shove 200 into a player who can only call 50 and
+   * the old behaviour pushed all 250 into the pots, then quietly handed 150 back
+   * as a side pot only the shover could win. The chips balanced, but the pot
+   * displayed 250 while the winner "won" 100, and the shover's stack jumped by
+   * 150 out of nowhere — money appearing from thin air, as far as the table
+   * could tell. Returning it up front keeps the pot honest and the payouts
+   * readable, and it is what a real dealer does.
+   */
+  private returnUncalledBet(): void {
+    let top: Player | null = null;
+    let topAmount = 0;
+    let secondAmount = 0;
+    for (const p of this.state.seats) {
+      if (!p || p.streetCommitted <= 0) continue;
+      if (p.streetCommitted > topAmount) {
+        secondAmount = topAmount;
+        topAmount = p.streetCommitted;
+        top = p;
+      } else if (p.streetCommitted > secondAmount) {
+        secondAmount = p.streetCommitted;
+      }
+    }
+    if (!top || topAmount <= secondAmount) return;
+
+    // Folding forfeits everything already pushed forward, so the top committer
+    // only gets change back if they are still in the hand. This is reachable:
+    // Room folds a disconnected player once their grace expires, which can land
+    // out of turn and leave the biggest bettor of the street folded. Refunding
+    // them would pay a player who gave up — and would mean betting big and
+    // pulling the plug got the chips back. Their chips still count as cover in
+    // the second-highest figure above, so nobody else is refunded over them.
+    if (top.status === PlayerStatus.Folded) return;
+
+    const excess = topAmount - secondAmount;
+    top.stack += excess;
+    top.streetCommitted -= excess;
+    top.handCommitted -= excess;
+    // A shove bigger than anyone could call leaves chips behind, so the player
+    // is not actually all-in any more.
+    if (top.status === PlayerStatus.AllIn && top.stack > 0) top.status = PlayerStatus.Active;
+    this.state.currentBet = secondAmount;
+  }
+
   private advanceStreet(): void {
+    this.returnUncalledBet();
     this.resetStreetTrackers();
 
     if (this.state.phase === Phase.River) {
@@ -468,6 +610,9 @@ export class GameEngine {
 
   /** Deal any remaining community cards with no betting, then show down. */
   private dealRemainingAndShowdown(): void {
+    // Reached straight from the blinds when everyone is already all-in, so this
+    // never passes through advanceStreet — refund here instead.
+    this.returnUncalledBet();
     this.state.actingIndex = null;
     if (this.state.phase === Phase.Preflop) {
       this.dealBoard(3);
@@ -514,6 +659,11 @@ export class GameEngine {
     if (inHand.length > 1) return false;
     if (inHand.length === 0) return false; // shouldn't happen
 
+    // The winner's own uncalled bet should come straight back rather than be
+    // paid out to them as "winnings" — otherwise a raise that took the pot
+    // reports a win far larger than what was actually collected.
+    this.returnUncalledBet();
+
     const winner = inHand[0]!;
     const pot = this.totalPot();
     winner.stack += pot;
@@ -537,15 +687,19 @@ export class GameEngine {
   private settleShowdown(): void {
     const contributions: Contribution[] = [];
     const holeCardsById: Record<string, [Card, Card]> = {};
+    const foldOrderById: Record<string, number> = {};
     for (const p of this.state.seats) {
       if (!p || p.handCommitted === 0) continue;
       contributions.push({
         playerId: p.id,
         contributed: p.handCommitted,
         folded: p.status === PlayerStatus.Folded,
+        foldOrder: p.foldOrder,
       });
+      if (p.foldOrder !== null) foldOrderById[p.id] = p.foldOrder;
       if (p.status !== PlayerStatus.Folded && p.holeCards) {
         holeCardsById[p.id] = p.holeCards;
+        this.statsOf(p.id).showdowns += 1;
       }
     }
 
@@ -561,6 +715,7 @@ export class GameEngine {
       holeCardsById,
       this.state.board,
       orderFromButton,
+      foldOrderById,
     );
 
     for (const [id, amount] of Object.entries(payouts)) {
@@ -588,6 +743,12 @@ export class GameEngine {
     this.state.phase = Phase.HandComplete;
     this.state.actingIndex = null;
     this.state.currentBet = 0;
+
+    // One "won" per player per hand, however many pots they took.
+    const winners = new Set<string>();
+    for (const r of result.potResults) for (const w of r.winners) winners.add(w.playerId);
+    for (const id of winners) this.statsOf(id).won += 1;
+
     // The pot has been paid out into stacks, so clear per-hand commitments:
     // after HAND_COMPLETE, each player's stack reflects everything they hold.
     for (const p of this.state.seats) {
@@ -596,6 +757,14 @@ export class GameEngine {
       p.handCommitted = 0;
       // Mark busted players (out of chips) so they are skipped next hand.
       if (p.stack === 0) p.status = PlayerStatus.Busted;
+    }
+
+    // Seats held open for players who left mid-hand can go now that the pot is
+    // settled and any chips they won have landed in their stack.
+    for (const id of [...this.pendingRemoval]) {
+      const seat = this.findSeatByPlayerId(id);
+      if (seat !== -1) this.clearSeat(seat, id);
+      else this.pendingRemoval.delete(id);
     }
   }
 
@@ -618,6 +787,21 @@ export class GameEngine {
   totalPot(): number {
     let sum = 0;
     for (const p of this.state.seats) if (p) sum += p.handCommitted;
+    return sum;
+  }
+
+  /**
+   * Chips gathered into the middle — everything committed this hand EXCEPT what
+   * is still sitting in front of players on the current street.
+   *
+   * A real dealer only pulls bets in once the street closes, and the UI draws
+   * those bets in front of each seat. Reporting the total here would double
+   * count them: they would show both in front of the player and in the pot, so
+   * the table would look like it holds more money than it does.
+   */
+  collectedPot(): number {
+    let sum = 0;
+    for (const p of this.state.seats) if (p) sum += p.handCommitted - p.streetCommitted;
     return sum;
   }
 

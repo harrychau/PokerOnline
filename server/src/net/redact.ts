@@ -63,6 +63,7 @@ export function redactStateFor(engine: GameEngine, opts: RedactOptions): PublicT
       isActing: seatIndex === s.actingIndex,
       connected: connectedIds.has(p.id),
       willSitOutNextHand: p.sitOutNextHand,
+      stats: engine.statsFor(p.id),
     };
     return seat;
   });
@@ -76,7 +77,8 @@ export function redactStateFor(engine: GameEngine, opts: RedactOptions): PublicT
     config: s.config,
     phase: s.phase,
     board: [...s.board],
-    pot: engine.totalPot(),
+    pot: engine.collectedPot(),
+    potTotal: engine.totalPot(),
     currentBet: s.currentBet,
     minRaiseSize: s.minRaiseSize,
     buttonIndex: s.buttonIndex,
